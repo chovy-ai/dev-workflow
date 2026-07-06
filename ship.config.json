@@ -1,0 +1,3 @@
+{
+  "testCmd": "npx tsc --noEmit"
+}
