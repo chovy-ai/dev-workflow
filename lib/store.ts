@@ -2,17 +2,19 @@ import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
 import { EventEmitter } from 'node:events';
-import type { RunEvent, RunEventType, RunRecord } from './types';
+import type { GroupRecord, RunEvent, RunEventType, RunRecord } from './types';
 
 /**
  * 持久化布局（SHIP_HOME，默认 ~/.ship-server）：
  *   runs/<id>/run.json        运行记录（状态机快照）
  *   runs/<id>/events.ndjson   事件流（web/cli 回放 + 实时推送的数据源）
  *   runs/<id>/engine-logs/    每次 engine 调用的完整输出
+ *   groups/<id>/group.json    运行组（纯聚合层，状态不落盘、实时推导）
  */
 export class Store {
   readonly root: string;
   private runs = new Map<string, RunRecord>();
+  private groups = new Map<string, GroupRecord>();
   private seqs = new Map<string, number>();
   /** 实时事件总线：emit(runId, event) */
   readonly bus = new EventEmitter();
@@ -20,7 +22,9 @@ export class Store {
   constructor(root?: string) {
     this.root = root ?? process.env.SHIP_HOME ?? path.join(os.homedir(), '.ship-server');
     fs.mkdirSync(path.join(this.root, 'runs'), { recursive: true });
+    fs.mkdirSync(path.join(this.root, 'groups'), { recursive: true });
     this.loadAll();
+    this.loadGroups();
   }
 
   private loadAll() {
@@ -43,6 +47,19 @@ export class Store {
     }
   }
 
+  private loadGroups() {
+    const groupsDir = path.join(this.root, 'groups');
+    for (const id of fs.readdirSync(groupsDir)) {
+      const f = path.join(groupsDir, id, 'group.json');
+      if (!fs.existsSync(f)) continue;
+      try {
+        this.groups.set(id, JSON.parse(fs.readFileSync(f, 'utf8')) as GroupRecord);
+      } catch {
+        /* 损坏的记录跳过 */
+      }
+    }
+  }
+
   private lastSeq(id: string): number {
     const events = this.readEvents(id);
     return events.length ? events[events.length - 1].seq : 0;
@@ -50,6 +67,10 @@ export class Store {
 
   runDir(id: string) {
     return path.join(this.root, 'runs', id);
+  }
+
+  groupDir(id: string) {
+    return path.join(this.root, 'groups', id);
   }
 
   list(): RunRecord[] {
@@ -73,6 +94,26 @@ export class Store {
     const dir = this.runDir(run.id);
     fs.mkdirSync(dir, { recursive: true });
     fs.writeFileSync(path.join(dir, 'run.json'), JSON.stringify(run, null, 2));
+  }
+
+  listGroups(): GroupRecord[] {
+    return [...this.groups.values()].sort((a, b) => b.createdAt.localeCompare(a.createdAt));
+  }
+
+  getGroup(id: string): GroupRecord | undefined {
+    return this.groups.get(id);
+  }
+
+  saveGroup(group: GroupRecord) {
+    this.groups.set(group.id, group);
+    const dir = this.groupDir(group.id);
+    fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(path.join(dir, 'group.json'), JSON.stringify(group, null, 2));
+  }
+
+  /** 取组的成员 run（丢弃已不存在的 id，保持创建顺序） */
+  groupRuns(group: GroupRecord): RunRecord[] {
+    return group.runIds.map((id) => this.runs.get(id)).filter((r): r is RunRecord => !!r);
   }
 
   event(run: RunRecord, type: RunEventType, data: Record<string, unknown>): RunEvent {

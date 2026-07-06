@@ -1,10 +1,17 @@
 #!/usr/bin/env node
 import { Command } from 'commander';
 import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
-import { DEFAULT_PORT, type RunEvent, type RunRecord } from '../lib/types';
+import {
+  DEFAULT_PORT,
+  type GroupRecord,
+  type GroupStatus,
+  type RunEvent,
+  type RunRecord,
+} from '../lib/types';
 
 const SERVER = process.env.SHIP_SERVER ?? `http://localhost:${DEFAULT_PORT}`;
 const PKG_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
@@ -42,6 +49,23 @@ function printRun(r: RunRecord) {
 }
 
 const webUrl = (id: string) => `${SERVER}/#/run/${id}`;
+const groupWebUrl = (id: string) => `${SERVER}/#/group/${id}`;
+
+/** 展开 ~ / ~/ 前缀为家目录 */
+function expandHome(p: string): string {
+  if (p === '~') return os.homedir();
+  if (p.startsWith('~/')) return path.join(os.homedir(), p.slice(2));
+  return p;
+}
+
+/** 取路径最后一段目录名（用于概览显示） */
+const dirName = (p: string) => p.replace(/\/+$/, '').split('/').pop() || p;
+
+/** 组列表项：GroupRecord + 推导状态 + 成员摘要 */
+type GroupSummary = GroupRecord & {
+  status: GroupStatus;
+  runs: { id: string; repoPath: string; stage: string; status: string }[];
+};
 
 /** 通过 SSE 实时跟踪一个 run，直到进入暂停/终态 */
 async function attach(runId: string): Promise<RunRecord> {
@@ -105,10 +129,16 @@ prog
 
 prog
   .command('start')
-  .description('从已确认的方案启动一条流水线（在目标仓库目录里运行）')
-  .requiredOption('--plan <file>', '方案 markdown 文件')
-  .option('--no-attach', '只创建不跟踪')
+  .description('从已确认的方案启动一条流水线（--plan，在目标仓库目录里运行）或一个运行组（--group）')
+  .option('--plan <file>', '方案 markdown 文件（单仓）')
+  .option('--group <manifest>', '运行组清单 JSON（多仓库联动）')
+  .option('--no-attach', '只创建不跟踪（单仓）')
   .action(async (o) => {
+    if (o.group) return startGroup(o.group);
+    if (!o.plan) {
+      console.error('✖ 需要 --plan <file> 或 --group <manifest.json>');
+      process.exit(1);
+    }
     const planFile = path.resolve(o.plan);
     if (!fs.existsSync(planFile)) {
       console.error(`✖ 方案文件不存在：${planFile}`);
@@ -121,6 +151,53 @@ prog
     console.log(`已创建运行 ${run.id}\nweb: ${webUrl(run.id)}\n`);
     if (o.attach) reportPause(await attach(run.id));
   });
+
+/**
+ * 组清单格式：{ title, repos: [{ path, plan }] }
+ * path 支持 ~ 展开和相对路径（相对清单文件所在目录）；plan 是该仓库内的方案文件路径。
+ * CLI 读出各方案文本后 POST /api/groups（server 不解析相对路径）。
+ */
+async function startGroup(manifestArg: string) {
+  const manifestFile = path.resolve(manifestArg);
+  if (!fs.existsSync(manifestFile)) {
+    console.error(`✖ 组清单不存在：${manifestFile}`);
+    process.exit(1);
+  }
+  let manifest: { title?: string; repos?: { path?: string; plan?: string }[] };
+  try {
+    manifest = JSON.parse(fs.readFileSync(manifestFile, 'utf8'));
+  } catch (e) {
+    console.error(`✖ 组清单不是合法 JSON：${(e as Error).message}`);
+    process.exit(1);
+  }
+  if (!manifest.title || !Array.isArray(manifest.repos) || manifest.repos.length === 0) {
+    console.error('✖ 清单需要 title 和非空 repos');
+    process.exit(1);
+  }
+  const manifestDir = path.dirname(manifestFile);
+  const repos = manifest.repos.map((r, i) => {
+    if (!r.path || !r.plan) {
+      console.error(`✖ 第 ${i + 1} 个 repo 需要 path 和 plan`);
+      process.exit(1);
+    }
+    const repoPath = path.resolve(manifestDir, expandHome(r.path));
+    const planFile = path.resolve(repoPath, expandHome(r.plan));
+    if (!fs.existsSync(planFile)) {
+      console.error(`✖ 方案文件不存在：${planFile}（仓库 ${r.path}）`);
+      process.exit(1);
+    }
+    return { repoPath, plan: fs.readFileSync(planFile, 'utf8') };
+  });
+
+  const { group } = (await api('POST', '/api/groups', { title: manifest.title, repos })) as {
+    group: GroupRecord;
+    runs: RunRecord[];
+  };
+  console.log(
+    `已创建运行组 ${group.id}（${group.runIds.length} 个仓库）\nweb: ${groupWebUrl(group.id)}\n`,
+  );
+  console.log('→ 各仓库独立推进，打开 web 看进度与门禁；或 ship groups 查看');
+}
 
 prog.command('ls').description('列出所有运行').action(async () => {
   const runs = (await api('GET', '/api/runs')) as RunRecord[];
@@ -175,6 +252,59 @@ prog
   .action(async (id) => {
     await api('POST', `/api/runs/${id}/continue`);
     reportPause(await attach(id));
+  });
+
+// ---------- 运行组（run group） ----------
+
+prog
+  .command('groups')
+  .description('列出所有运行组（状态 + 成员概览）')
+  .action(async () => {
+    const groups = (await api('GET', '/api/groups')) as GroupSummary[];
+    if (!groups.length) return console.log('（还没有运行组）');
+    for (const g of groups) {
+      console.log(`${STATUS_ICON[g.status] ?? '?'} ${g.id}  [${g.status}]  ${g.title}`);
+      for (const r of g.runs)
+        console.log(
+          `    ${STATUS_ICON[r.status] ?? '?'} ${dirName(r.repoPath)}  [${r.stage}/${r.status}]  ${r.id}`,
+        );
+    }
+  });
+
+prog
+  .command('approve-group <gid>')
+  .description('整组通过：把所有就绪成员推进到 PR 阶段')
+  .action(async (gid) => {
+    const res = (await api('POST', `/api/groups/${gid}/approve`)) as { runIds: string[] };
+    console.log(`已整组通过，推进 ${res.runIds.length} 个就绪成员 → 提 PR`);
+    console.log(`web: ${groupWebUrl(gid)}`);
+  });
+
+prog
+  .command('reject-group <gid>')
+  .description('联动打回组内成员（默认全组；--repos 指定仓库路径后缀）')
+  .requiredOption('-m, --message <feedback>', '打回意见')
+  .option('--repos <paths>', '仓库路径后缀，逗号分隔（省略=全组）')
+  .action(async (gid, o) => {
+    const detail = (await api('GET', `/api/groups/${gid}`)) as { group: GroupRecord; runs: RunRecord[] };
+    let targets = detail.runs;
+    if (o.repos) {
+      const suffixes = String(o.repos)
+        .split(',')
+        .map((s: string) => s.trim())
+        .filter(Boolean);
+      targets = detail.runs.filter((r) => suffixes.some((s) => r.repoPath.endsWith(s)));
+      if (!targets.length) {
+        console.error(`✖ --repos 没匹配到任何成员（组内：${detail.runs.map((r) => dirName(r.repoPath)).join(', ')}）`);
+        process.exit(1);
+      }
+    }
+    const res = (await api('POST', `/api/groups/${gid}/reject`, {
+      feedback: o.message,
+      runIds: targets.map((r) => r.id),
+    })) as { runIds: string[] };
+    console.log(`已联动打回 ${res.runIds.length} 个成员：${targets.map((r) => dirName(r.repoPath)).join(', ')}`);
+    console.log(`web: ${groupWebUrl(gid)}`);
   });
 
 prog.parseAsync();
