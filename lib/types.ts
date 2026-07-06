@@ -80,6 +80,8 @@ export interface RunRecord {
   title: string;
   repoPath: string;
   branch: string | null;
+  /** 所属运行组（run group）id；无组的单仓运行不带此字段 */
+  groupId?: string;
   plan: string;
   stage: StageName;
   status: RunStatus;
@@ -99,6 +101,36 @@ export interface RunRecord {
   createdAt: string;
   updatedAt: string;
   config: RunConfig;
+}
+
+/**
+ * 运行组（run group）：一组仓库的 run 的纯聚合层。
+ * 组不引入跨仓库执行耦合，没有依赖顺序，组内各 run 完全并行、各自独立推进。
+ * 组状态不落盘，由成员 run 的状态实时推导（见 deriveGroupStatus）。
+ */
+export interface GroupRecord {
+  id: string;
+  title: string;
+  /** 成员 run id（创建顺序） */
+  runIds: string[];
+  createdAt: string;
+}
+
+/**
+ * 组状态（推导，不落盘）：
+ * running          有成员推进中
+ * blocked          无推进中，但有成员 blocked / failed
+ * awaiting_review  无推进中/阻塞，但有成员等人工 review
+ * done             全部完成
+ */
+export type GroupStatus = 'running' | 'blocked' | 'awaiting_review' | 'done';
+
+/** 从成员 run 推导组状态（供 API 与 web 复用）。空成员按 done 处理。 */
+export function deriveGroupStatus(runs: RunRecord[]): GroupStatus {
+  if (runs.some((r) => r.status === 'running')) return 'running';
+  if (runs.some((r) => r.status === 'blocked' || r.status === 'failed')) return 'blocked';
+  if (runs.some((r) => r.status === 'awaiting_review')) return 'awaiting_review';
+  return 'done';
 }
 
 export type RunEventType =
