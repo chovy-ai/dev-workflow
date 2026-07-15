@@ -301,13 +301,25 @@ export class Pipeline {
     }
   }
 
-  /** 第 1 轮：reviewEngines 里每个 engine 各自对分支累计 diff 独立全量审查 */
+  /** 按 reviewRoles 取该 engine 的审查分工文本（architecture / fidelity；未配置角色 → 通用审查） */
+  private focusFor(engineName: string): string | undefined {
+    const role = this.cfg.reviewRoles?.[engineName];
+    return role ? P.REVIEW_FOCUS[role] : undefined;
+  }
+
+  /** 第 1 轮：reviewEngines 里每个 engine 各自对分支累计 diff 独立全量审查（按 reviewRoles 分工） */
   private async runFullReview(round: number): Promise<Record<string, EngineVerdict>> {
     const lessons = this.lessonsContext();
     const entries = await Promise.all(
       this.cfg.reviewEngines.map(async (name) => {
         const v = await this.reviewWithEngine(name, `review-${round}-${name}`, false, (reviewJson) =>
-          P.reviewPrompt({ base: this.cfg.base, reviewJson, plan: this.run.plan, lessons }),
+          P.reviewPrompt({
+            base: this.cfg.base,
+            reviewJson,
+            plan: this.run.plan,
+            lessons,
+            focus: this.focusFor(name),
+          }),
         );
         return [name, v] as const;
       }),
@@ -339,10 +351,11 @@ export class Pipeline {
                 plan: this.run.plan,
                 findings: findingsText(prev[name].mustFix),
                 fixBaseSha,
+                focus: this.focusFor(name),
               }),
             )
           : await this.reviewWithEngine(name, `review-${round}-${name}-delta`, true, (reviewJson) =>
-              P.deltaReviewPrompt({ reviewJson, plan: this.run.plan, fixBaseSha }),
+              P.deltaReviewPrompt({ reviewJson, plan: this.run.plan, fixBaseSha, focus: this.focusFor(name) }),
             );
         return [name, v] as const;
       }),
@@ -375,6 +388,7 @@ export class Pipeline {
             plan: this.run.plan,
             findings: findingsText(v.mustFix),
             fixBaseSha,
+            focus: this.focusFor(name),
           }),
         );
       }),

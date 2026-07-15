@@ -119,6 +119,18 @@ function buildConfig(repo: string, override?: Partial<RunConfig>): RunConfig {
   return config;
 }
 
+/** 方案最小体量：符合性审查把方案当合同逐条核对，太短的方案两边审查都没有依据 */
+const MIN_PLAN_CHARS = 300;
+
+function planTooSimpleError(plan: string): string | null {
+  const len = plan.trim().length;
+  if (len >= MIN_PLAN_CHARS) return null;
+  return (
+    `方案太简单（${len} 字 < ${MIN_PLAN_CHARS}），拒绝创建：双边审查需要方案作为"合同"——` +
+    `请补齐目标/背景、逐项改动点、约束、验收标准后重试`
+  );
+}
+
 /**
  * 同仓库已有「相同方案且还在跑」的 run 时拒绝重复创建——同一方案并行跑两份纯属烧算力
  * （worktree 隔离下两份都能跑完，但只会合并出两个重复 PR）。方案不同的并行 run 不受影响。
@@ -210,6 +222,8 @@ export async function createRun(input: {
   if (engineErr) return { error: engineErr, status: 400 };
   const dupErr = duplicateRunError(repo, input.plan);
   if (dupErr) return { error: dupErr, status: 409 };
+  const planErr = planTooSimpleError(input.plan);
+  if (planErr) return { error: planErr, status: 400 };
   const run = startRun({ repo, plan: input.plan, title: input.title, config });
   return { run, status: 201 };
 }
@@ -239,6 +253,8 @@ export async function createGroup(input: {
     if (engineErr) return { error: `${item.repoPath}: ${engineErr}`, status: 400 };
     const dupErr = duplicateRunError(repo, item.plan);
     if (dupErr) return { error: `${item.repoPath}: ${dupErr}`, status: 409 };
+    const planErr = planTooSimpleError(item.plan);
+    if (planErr) return { error: `${item.repoPath}: ${planErr}`, status: 400 };
     resolved.push({ repo, plan: item.plan, config });
   }
 

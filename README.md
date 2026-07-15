@@ -33,9 +33,12 @@ web 只是一个只读的进度看板。
 ## 为什么是代码而不是提示词
 
 - **worktree 是隔离红线**——LLM 在自己的检出目录里改代码，物理上碰不到原仓库当前签出的分支/改动
-- **双边审查是质量红线**——`reviewEngines`（默认 `claude` + `codex`）各自独立跑一遍审查、各写各的
-  `.ship/review-<engine>.json`，**必须两边都 pass 才算过**；任一方打回都要修复后复审，
-  没有人工兜底，靠两个厂商互相盯梢补盲区。审查按轮收窄保证收敛：第 1 轮双边全量（分支累计 diff），
+- **双边审查是质量红线，且是分工制**——`reviewEngines`（默认 `claude` + `codex`）各自独立跑审查、
+  各写各的 `.ship/review-<engine>.json`，**必须两边都 pass 才算过**；任一方打回都要修复后复审，
+  没有人工兜底。`reviewRoles` 给两边分工（默认 claude→architecture：全局架构视角，专抓"只为实现
+  而实现"的设计短视；codex→fidelity：把方案当合同逐条核对实现有没有走样），各扫各的盲区，
+  不再两份全量重复审同一类问题；方案因此必须足够详细（<300 字创建时直接拒绝——方案是符合性审查的合同）。
+  审查按轮收窄保证收敛：第 1 轮双边全量（分支累计 diff），
   第 2 轮起打回方复核自己的旧意见 + 修复增量、放行方只扫修复增量，must_fix 只能来自
   「旧意见未修好」或「增量新问题」；旧范围新发现默认降级 advisory 附进 PR 描述（审查者给出
   escape_reason 才能例外阻塞）。终局轮若只剩「旧意见未修净」，还有一次锁定范围的窄门补救
@@ -107,6 +110,7 @@ agent 会收到"后台任务完成"通知，从而在不占用当前对话轮次
   "maxCiRounds": 5,
   "maxFixRounds": 5,
   "reviewEngines": ["claude", "codex"],
+  "reviewRoles": { "claude": "architecture", "codex": "fidelity" },
   "engines": { "自定义名": ["命令", "参数", "{prompt}"] }
 }
 ```

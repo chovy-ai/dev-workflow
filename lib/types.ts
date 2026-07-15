@@ -69,6 +69,13 @@ export interface RunConfig {
    * 没有人工兜底了，双边审查是唯一的质量把关。
    */
   reviewEngines: string[];
+  /**
+   * 审查分工：engine 名 → 审查角色（架构/符合性各扫各的盲区，避免两个 engine 重复做同一类审查）。
+   * architecture  全局架构视角：设计是否困于"只为实现而实现"、模块边界、可演进性
+   * fidelity      方案符合性：把 plan 当合同逐条核对实现是否走样
+   * 未配置角色的 engine 用通用审查 prompt。默认 claude→architecture、codex→fidelity。
+   */
+  reviewRoles?: Record<string, string>;
 }
 
 /** engine 调用的步骤类型（用于 stageEngines / reviewEngines 路由） */
@@ -207,6 +214,7 @@ export const DEFAULT_CONFIG: RunConfig = {
   maxCiRounds: 5,
   maxFixRounds: 5,
   reviewEngines: ['claude', 'codex'],
+  reviewRoles: { claude: 'architecture', codex: 'fidelity' },
   engines: {
     // 默认走各家官方 SDK（进程内、流式、会话续传）；-cli 变体是外部命令后备
     claude: { type: 'claude-sdk' },
