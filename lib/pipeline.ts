@@ -828,10 +828,28 @@ export class Pipeline {
     }
   }
 
+  /**
+   * codex 的 workspace-write 沙箱只放行 cwd、/tmp、$TMPDIR，而 worktree 的真实 git 元数据
+   * 在主仓库 .git/ 下（沙箱外）——不加进可写目录，codex 在沙箱内的 git add/commit 一律
+   * EPERM（headless 下 approval never，也没有升权通道可走）。
+   * 普通仓库（git 元数据就在 <cwd>/.git）不加：codex 对它有意保持只读，交给 autoCommitIfDirty 兜底。
+   */
+  private async codexExtraWritableDirs(cwd: string): Promise<string[]> {
+    const r = await git(cwd, 'rev-parse', '--git-common-dir');
+    if (r.code !== 0) return [];
+    const gitDir = path.resolve(cwd, r.out);
+    const rel = path.relative(cwd, gitDir);
+    const outsideCwd = rel.startsWith('..') || path.isAbsolute(rel);
+    return outsideCwd ? [gitDir] : [];
+  }
+
   private async autoCommitIfDirty(msg: string) {
-    const dirty = (await git(this.repo, 'status', '--porcelain', '--untracked-files=no')).out;
+    // 必须含未跟踪文件：codex 沙箱内 git add 会被拒（gitdir 在沙箱可写范围外），
+    // engine 新增的文件只能靠这里兜底提交。.ship/ 用 pathspec 再排除一层，
+    // 防 info/exclude 写入失败时把 harness 工作目录扫进提交。
+    const dirty = (await git(this.repo, 'status', '--porcelain', '--', '.', ':!.ship')).out;
     if (!dirty) return;
-    await git(this.repo, 'add', '-u');
+    await git(this.repo, 'add', '-A', '--', '.', ':!.ship');
     await git(this.repo, 'commit', '-m', msg);
     this.log(`⚠ engine 留下未提交改动，已代为提交（${msg}）`);
   }
@@ -875,7 +893,14 @@ export class Pipeline {
       const res =
         spec.type === 'claude-sdk'
           ? await runSdkEngine({ prompt, cwd, spec, resume, onLine })
-          : await runCodexSdkEngine({ prompt, cwd, spec, resume, onLine });
+          : await runCodexSdkEngine({
+              prompt,
+              cwd,
+              spec,
+              resume,
+              onLine,
+              additionalDirectories: await this.codexExtraWritableDirs(cwd),
+            });
       if (kind !== 'review' && res.sessionId) {
         this.run.sdkSessions[engineName] = res.sessionId;
         this.store.save(this.run);

@@ -28,6 +28,8 @@ export async function runCodexSdkEngine(p: {
   spec: CodexSdkSpec;
   resume: string | null;
   onLine: (line: string) => void;
+  /** 额外可写目录（映射 codex --add-dir）。worktree 场景必须带上主仓库 .git，否则沙箱内 git add/commit 全被拒 */
+  additionalDirectories?: string[];
 }): Promise<CodexSdkResult> {
   let sessionId: string | null = p.resume;
   try {
@@ -42,6 +44,7 @@ export async function runCodexSdkEngine(p: {
       ...(p.spec.networkAccessEnabled !== undefined
         ? { networkAccessEnabled: p.spec.networkAccessEnabled }
         : {}),
+      ...(p.additionalDirectories?.length ? { additionalDirectories: p.additionalDirectories } : {}),
     };
     const thread = p.resume
       ? codexSingleton.resumeThread(p.resume, threadOpts)
