@@ -37,7 +37,7 @@ async function api(method: string, p: string, body?: unknown): Promise<any> {
 }
 
 const STATUS_ICON: Record<string, string> = {
-  running: '▶', awaiting_review: '⏸', blocked: '⛔', failed: '✖', done: '✔',
+  running: '▶', failed: '✖', done: '✔',
 };
 
 function printRun(r: RunRecord) {
@@ -105,17 +105,14 @@ async function attach(runId: string): Promise<RunRecord> {
   return (await api('GET', `/api/runs/${runId}`)) as RunRecord;
 }
 
-function reportPause(run: RunRecord) {
+function reportResult(run: RunRecord) {
   console.log('');
   printRun(run);
-  if (run.status === 'awaiting_review')
-    console.log(`\n→ 打开 web review：${webUrl(run.id)}\n  （或 ship approve ${run.id} / ship reject ${run.id} -m "意见"）`);
-  else if (run.status === 'blocked' || run.status === 'failed')
-    console.log(`\n→ 处理后续跑：ship continue ${run.id}   （详情：${webUrl(run.id)}）`);
-  else if (run.status === 'done') console.log('\n→ 请人工审阅并合并 PR（harness 永不 merge）');
+  if (run.status === 'failed') console.log(`\n→ 运行已终止，需要重新发起：ship start ...   （详情：${webUrl(run.id)}）`);
+  else if (run.status === 'done') console.log('\n→ 已全自动完成，PR 已合并');
 }
 
-const prog = new Command('ship').description('方案 → PR 的代码化交付 harness（Next.js server + web review，本地）');
+const prog = new Command('ship').description('方案 → 自动合并 PR 的代码化交付 harness（全自动，Next.js server + web 只读看板，本地）');
 
 prog
   .command('serve')
@@ -132,9 +129,10 @@ prog
   .description('从已确认的方案启动一条流水线（--plan，在目标仓库目录里运行）或一个运行组（--group）')
   .option('--plan <file>', '方案 markdown 文件（单仓）')
   .option('--group <manifest>', '运行组清单 JSON（多仓库联动）')
+  .option('--engine <name>', '实现/修复步骤用的 engine（如 claude / codex，默认 claude；双边审查不受影响。--group 时作为各仓库的默认值，可被清单里的 engine 覆盖）')
   .option('--no-attach', '只创建不跟踪（单仓）')
   .action(async (o) => {
-    if (o.group) return startGroup(o.group);
+    if (o.group) return startGroup(o.group, o.engine);
     if (!o.plan) {
       console.error('✖ 需要 --plan <file> 或 --group <manifest.json>');
       process.exit(1);
@@ -147,23 +145,29 @@ prog
     const run = (await api('POST', '/api/runs', {
       repoPath: process.cwd(),
       plan: fs.readFileSync(planFile, 'utf8'),
+      ...(o.engine ? { config: { engine: o.engine } } : {}),
     })) as RunRecord;
     console.log(`已创建运行 ${run.id}\nweb: ${webUrl(run.id)}\n`);
-    if (o.attach) reportPause(await attach(run.id));
+    if (o.attach) reportResult(await attach(run.id));
   });
 
 /**
- * 组清单格式：{ title, repos: [{ path, plan }] }
+ * 组清单格式：{ title, engine?, repos: [{ path, plan, engine? }] }
  * path 支持 ~ 展开和相对路径（相对清单文件所在目录）；plan 是该仓库内的方案文件路径。
+ * engine 决定该仓库实现/修复步骤用哪个 engine，优先级：仓库项 > 清单顶层 > --engine > 默认。
  * CLI 读出各方案文本后 POST /api/groups（server 不解析相对路径）。
  */
-async function startGroup(manifestArg: string) {
+async function startGroup(manifestArg: string, engineFlag?: string) {
   const manifestFile = path.resolve(manifestArg);
   if (!fs.existsSync(manifestFile)) {
     console.error(`✖ 组清单不存在：${manifestFile}`);
     process.exit(1);
   }
-  let manifest: { title?: string; repos?: { path?: string; plan?: string }[] };
+  let manifest: {
+    title?: string;
+    engine?: string;
+    repos?: { path?: string; plan?: string; engine?: string }[];
+  };
   try {
     manifest = JSON.parse(fs.readFileSync(manifestFile, 'utf8'));
   } catch (e) {
@@ -186,17 +190,23 @@ async function startGroup(manifestArg: string) {
       console.error(`✖ 方案文件不存在：${planFile}（仓库 ${r.path}）`);
       process.exit(1);
     }
-    return { repoPath, plan: fs.readFileSync(planFile, 'utf8') };
+    const engine = r.engine ?? manifest.engine ?? engineFlag;
+    return {
+      repoPath,
+      plan: fs.readFileSync(planFile, 'utf8'),
+      ...(engine ? { config: { engine } } : {}),
+    };
   });
 
-  const { group } = (await api('POST', '/api/groups', { title: manifest.title, repos })) as {
+  const { group, runs } = (await api('POST', '/api/groups', { title: manifest.title, repos })) as {
     group: GroupRecord;
     runs: RunRecord[];
   };
   console.log(
     `已创建运行组 ${group.id}（${group.runIds.length} 个仓库）\nweb: ${groupWebUrl(group.id)}\n`,
   );
-  console.log('→ 各仓库独立推进，打开 web 看进度与门禁；或 ship groups 查看');
+  for (const r of runs) console.log(`  ${r.id}  ${dirName(r.repoPath)}`);
+  console.log('\n→ 各仓库独立全自动推进，打开 web 看进度；或 ship groups 查看');
 }
 
 prog.command('ls').description('列出所有运行').action(async () => {
@@ -215,43 +225,8 @@ prog
   .description('实时跟踪运行输出')
   .action(async (id) => {
     const run = (await api('GET', `/api/runs/${id}`)) as RunRecord;
-    if (run.status !== 'running') return reportPause(run);
-    reportPause(await attach(id));
-  });
-
-prog
-  .command('approve <id>')
-  .description('人工 review 通过 → 提 PR → CI')
-  .action(async (id) => {
-    await api('POST', `/api/runs/${id}/approve`);
-    console.log('已通过，继续跟踪：');
-    reportPause(await attach(id));
-  });
-
-prog
-  .command('reject <id>')
-  .description('人工打回：修复 → LLM 复审 → 重新到人工门禁')
-  .requiredOption('-m, --message <feedback>', '打回意见')
-  .action(async (id, o) => {
-    await api('POST', `/api/runs/${id}/reject`, { feedback: o.message });
-    console.log('已打回，继续跟踪：');
-    reportPause(await attach(id));
-  });
-
-prog
-  .command('cancel <id>')
-  .description('取消一个停着的运行（释放该仓库的流水线名额）')
-  .action(async (id) => {
-    await api('POST', `/api/runs/${id}/cancel`);
-    console.log(`已取消 ${id}`);
-  });
-
-prog
-  .command('continue <id>')
-  .description('阻塞处理后从当前阶段续跑')
-  .action(async (id) => {
-    await api('POST', `/api/runs/${id}/continue`);
-    reportPause(await attach(id));
+    if (run.status !== 'running') return reportResult(run);
+    reportResult(await attach(id));
   });
 
 // ---------- 运行组（run group） ----------
@@ -269,42 +244,6 @@ prog
           `    ${STATUS_ICON[r.status] ?? '?'} ${dirName(r.repoPath)}  [${r.stage}/${r.status}]  ${r.id}`,
         );
     }
-  });
-
-prog
-  .command('approve-group <gid>')
-  .description('整组通过：把所有就绪成员推进到 PR 阶段')
-  .action(async (gid) => {
-    const res = (await api('POST', `/api/groups/${gid}/approve`)) as { runIds: string[] };
-    console.log(`已整组通过，推进 ${res.runIds.length} 个就绪成员 → 提 PR`);
-    console.log(`web: ${groupWebUrl(gid)}`);
-  });
-
-prog
-  .command('reject-group <gid>')
-  .description('联动打回组内成员（默认全组；--repos 指定仓库路径后缀）')
-  .requiredOption('-m, --message <feedback>', '打回意见')
-  .option('--repos <paths>', '仓库路径后缀，逗号分隔（省略=全组）')
-  .action(async (gid, o) => {
-    const detail = (await api('GET', `/api/groups/${gid}`)) as { group: GroupRecord; runs: RunRecord[] };
-    let targets = detail.runs;
-    if (o.repos) {
-      const suffixes = String(o.repos)
-        .split(',')
-        .map((s: string) => s.trim())
-        .filter(Boolean);
-      targets = detail.runs.filter((r) => suffixes.some((s) => r.repoPath.endsWith(s)));
-      if (!targets.length) {
-        console.error(`✖ --repos 没匹配到任何成员（组内：${detail.runs.map((r) => dirName(r.repoPath)).join(', ')}）`);
-        process.exit(1);
-      }
-    }
-    const res = (await api('POST', `/api/groups/${gid}/reject`, {
-      feedback: o.message,
-      runIds: targets.map((r) => r.id),
-    })) as { runIds: string[] };
-    console.log(`已联动打回 ${res.runIds.length} 个成员：${targets.map((r) => dirName(r.repoPath)).join(', ')}`);
-    console.log(`web: ${groupWebUrl(gid)}`);
   });
 
 prog.parseAsync();

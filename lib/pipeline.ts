@@ -8,15 +8,8 @@ import { runSdkEngine } from './sdkEngine';
 import { runCodexSdkEngine } from './codexSdkEngine';
 import * as P from './prompts';
 
-/** 流水线主动停下（非异常崩溃）：blocked=需人工处理后 continue；awaiting=等 web review */
-class Halt extends Error {
-  constructor(
-    public kind: 'blocked' | 'failed',
-    msg: string,
-  ) {
-    super(msg);
-  }
-}
+/** 流水线主动停下（非异常崩溃）：没有人工兜底，一律终结为 failed，不支持 continue */
+class Halt extends Error {}
 
 export class Pipeline {
   constructor(
@@ -24,8 +17,13 @@ export class Pipeline {
     private store: Store,
   ) {}
 
-  private get repo() {
+  /** 原仓库路径：只用来管理 worktree 本身（add/remove）和最初的 fetch */
+  private get originRepo() {
     return this.run.repoPath;
+  }
+  /** 实际工作目录：worktree 建好之前的兜底只在 stageWorktree 内部短暂生效 */
+  private get repo() {
+    return this.run.worktreePath ?? this.run.repoPath;
   }
   private get cfg() {
     return this.run.config;
@@ -51,9 +49,19 @@ export class Pipeline {
     this.store.event(this.run, 'stage', { stage });
   }
 
+  /**
+   * worktree 里 .git 是个指向真正 git-dir 的文件而非目录（`.git/worktrees/<name>`），
+   * 不能直接拼 `<repo>/.git/...`——凡是要落到 git-dir 内部的路径（info/exclude、rebase 状态）都得
+   * 先问 git 要实际 git-dir。
+   */
+  private async gitDir(): Promise<string> {
+    const gd = (await git(this.repo, 'rev-parse', '--git-dir')).out;
+    return path.isAbsolute(gd) ? gd : path.join(this.repo, gd);
+  }
+
   /** .ship/ 是 harness 工作目录，绝不能进提交（engine 可能 git add -A） */
-  private ensureShipExcluded() {
-    const exclude = path.join(this.repo, '.git', 'info', 'exclude');
+  private async ensureShipExcluded() {
+    const exclude = path.join(await this.gitDir(), 'info', 'exclude');
     try {
       const cur = fs.existsSync(exclude) ? fs.readFileSync(exclude, 'utf8') : '';
       if (!cur.includes('.ship/')) {
@@ -65,15 +73,14 @@ export class Pipeline {
     }
   }
 
-  /** 推进状态机直到：暂停（人工门禁）/ 阻塞 / 失败 / 完成 */
+  /** 推进状态机直到：失败 / 完成。全自动，没有暂停点。 */
   async advance(): Promise<void> {
-    this.ensureShipExcluded();
     this.setStatus('running');
     try {
       while (true) {
         switch (this.run.stage) {
-          case 'branch':
-            await this.stageBranch();
+          case 'worktree':
+            await this.stageWorktree();
             this.setStage('implement');
             break;
           case 'implement':
@@ -82,60 +89,80 @@ export class Pipeline {
             break;
           case 'autoReview':
             await this.stageAutoReview();
-            this.setStage('humanReview');
+            this.setStage('pr');
             break;
-          case 'humanReview':
-            // 人工门禁：停住，等 web/cli 的 approve 或 reject
-            this.setStatus('awaiting_review', '等待人工 review：通过 → 提 PR；打回 → 修复后复审');
-            return;
           case 'pr':
             await this.stagePr();
             this.setStage('ci');
             break;
           case 'ci':
             await this.stageCi();
+            await this.stageMerge();
             this.setStage('done');
             break;
           case 'done':
-            this.setStatus('done', 'review/CI 已过，等待人工合并 PR');
-            this.log('✔ 全部完成，请在 GitHub 上人工审阅并合并 PR');
+            this.setStatus('done', '全自动完成：双边 LLM review 通过、测试/CI 绿、PR 已自动合并');
+            this.log('✔ 全部完成（已自动合并 PR，无需人工操作）');
             return;
         }
       }
     } catch (e) {
       if (e instanceof Halt) {
-        this.setStatus(e.kind === 'blocked' ? 'blocked' : 'failed', e.message);
+        this.setStatus('failed', e.message);
         this.log(`✖ ${e.message}`);
       } else {
         this.setStatus('failed', String(e));
         this.store.event(this.run, 'error', { error: String(e) });
       }
+    } finally {
+      await this.cleanupWorktree();
     }
   }
 
   // ---------------------------------------------------------- stages
 
-  private async stageBranch() {
-    this.log(`阶段 branch：基于最新 origin/${this.cfg.base} 建分支`);
-    const cur = (await git(this.repo, 'branch', '--show-current')).out;
-    if (cur && cur !== this.cfg.base) {
-      this.log(`已在分支 ${cur}，跳过建分支`);
-      this.run.branch = cur;
-      this.store.save(this.run);
-      return;
-    }
-    const dirty = (await git(this.repo, 'status', '--porcelain', '--untracked-files=no')).out;
-    if (dirty) throw new Halt('blocked', `${this.cfg.base} 上有未提交改动，请先处理再 continue`);
-    await git(this.repo, 'fetch', 'origin');
-    const name = this.run.branch ?? this.branchName();
-    let r = await git(this.repo, 'checkout', '-b', name, `origin/${this.cfg.base}`);
-    if (r.code !== 0) r = await git(this.repo, 'checkout', '-b', name); // 无远端 base 时退回本地
-    if (r.code !== 0) throw new Halt('failed', `建分支失败：${r.out}`);
+  /** 基于最新 origin/base 建 git worktree（不碰原仓库的工作目录，原仓库脏不脏都无所谓） */
+  private async stageWorktree() {
+    this.log(`阶段 worktree：基于最新 origin/${this.cfg.base} 建 git worktree`);
+    await git(this.originRepo, 'fetch', 'origin');
+    const name = this.branchName();
+    const wtPath = path.join(this.store.runDir(this.run.id), 'worktree');
+    let r = await git(this.originRepo, 'worktree', 'add', '-b', name, wtPath, `origin/${this.cfg.base}`);
+    if (r.code !== 0)
+      // 无远端 base（罕见）或分支名已存在时，退回：不新建分支、直接基于已有引用建 worktree
+      r = await git(this.originRepo, 'worktree', 'add', wtPath, name);
+    if (r.code !== 0) throw new Halt(`建 worktree 失败：${r.out}`);
     this.run.branch = name;
+    this.run.worktreePath = wtPath;
     this.store.save(this.run);
-    this.log(`✔ 分支 ${name}`);
+    await this.ensureShipExcluded();
+    this.log(`✔ worktree ${wtPath}（分支 ${name}）`);
   }
 
+  /** 运行到终态（成功或失败）后清理 worktree，避免每次运行都在磁盘上留一份残留检出 */
+  private async cleanupWorktree() {
+    if (!this.run.worktreePath) return;
+    const wt = this.run.worktreePath;
+    this.log('阶段 cleanup：删除 worktree');
+    const rm = await git(this.originRepo, 'worktree', 'remove', '--force', wt);
+    if (rm.code !== 0) {
+      // worktree 记录损坏等极端情况下的兜底：直接物理删除 + prune 清干净引用
+      fs.rmSync(wt, { recursive: true, force: true });
+      await git(this.originRepo, 'worktree', 'prune');
+    }
+    this.run.worktreePath = null;
+    this.store.save(this.run);
+    const branchNote =
+      this.run.status === 'done'
+        ? '（PR 已合并，分支可在 GitHub 上按仓库设置处理）'
+        : `（分支 ${this.run.branch} 仍保留在原仓库，可用于排查失败原因）`;
+    this.log(`✔ worktree 已删除 ${branchNote}`);
+  }
+
+  /**
+   * 带 run id 后缀：同仓库现在允许并行跑多条 run，纯靠 plan 首行生成的名字可能撞车
+   * （哪怕方案不同，首行标题一样就会撞）；run id 天然唯一，顺带也方便从分支名反查是哪条 run 建的。
+   */
   private branchName(): string {
     const first = this.run.plan.split('\n').find((l) => l.trim()) ?? 'ship-work';
     const slug = first
@@ -144,13 +171,14 @@ export class Pipeline {
       .replace(/[^a-z0-9]+/g, '-')
       .replace(/^-+|-+$/g, '')
       .slice(0, 40);
-    return `feat/${slug || 'ship-work'}`;
+    const suffix = this.run.id.split('-').pop();
+    return `feat/${slug || 'ship-work'}-${suffix}`;
   }
 
   private async assertOnFeatureBranch() {
     const cur = (await git(this.repo, 'branch', '--show-current')).out;
     if (cur === this.cfg.base)
-      throw new Halt('blocked', `当前在 ${this.cfg.base} 上，拒绝继续（红线：不在基线分支上改动）`);
+      throw new Halt(`当前在 ${this.cfg.base} 上，拒绝继续（红线：不在基线分支上改动）`);
   }
 
   private async stageImplement() {
@@ -165,44 +193,30 @@ export class Pipeline {
     // 空实现门禁：引擎失败/没做事时，旧测试照样绿，不能放行
     const commits = (await git(this.repo, 'rev-list', '--count', `${this.cfg.base}..HEAD`)).out;
     if (commits === '0')
-      throw new Halt('blocked', 'implement 结束但没有产生任何提交（引擎可能失败），检查引擎输出后 continue 重试');
+      throw new Halt('implement 结束但没有产生任何提交（引擎可能失败），运行终止');
     await this.gateTests();
   }
 
   private async stageAutoReview() {
-    this.log('阶段 autoReview：独立 LLM 审查 ↔ 修复循环（代码裁决）');
+    this.log(`阶段 autoReview：${this.cfg.reviewEngines.join(' + ')} 双边独立审查 ↔ 修复循环（任一方打回即不通过）`);
     await this.assertOnFeatureBranch();
-    // 人工打回的意见先修再审
-    if (this.run.feedback.length) {
-      const fb = this.run.feedback.map((x) => `- ${x}`).join('\n');
-      this.log('先处理打回意见');
-      await this.engineRun(P.fixPrompt({ findings: fb, plan: this.run.plan }), 'rework-fix', 'fix');
-      this.run.feedback = [];
-      this.store.save(this.run);
-      await this.autoCommitIfDirty('ship: address human review feedback');
-      await this.gateTests();
-    }
-    // 轮数只在本次循环内累积：熔断→人工介入→continue 后重新获得完整预算
     this.run.reviewRound = 0;
     while (true) {
       this.run.reviewRound += 1;
       const round = this.run.reviewRound;
       this.store.save(this.run);
       if (round > this.cfg.maxReviewRounds)
-        throw new Halt(
-          'blocked',
-          `review 循环达到上限 ${this.cfg.maxReviewRounds} 轮仍未通过，需要人工决策（可打回附意见或 continue 重试）`,
-        );
+        throw new Halt(`review 循环达到上限 ${this.cfg.maxReviewRounds} 轮仍未通过，运行终止`);
       this.log(`── review 第 ${round} 轮`);
       const { passed, findings } = await this.runReview(round);
       this.run.findings = findings;
       this.store.save(this.run);
       this.store.event(this.run, 'review', { round, passed, findings });
       if (passed) {
-        this.log(`✔ LLM review 通过（第 ${round} 轮）`);
+        this.log(`✔ 双边 review 均通过（第 ${round} 轮）`);
         return;
       }
-      const text = findings.map((f) => `- [${f.file}] ${f.issue}`).join('\n');
+      const text = findings.map((f) => `- [${f.file}]${f.reviewer ? ` (${f.reviewer})` : ''} ${f.issue}`).join('\n');
       this.log(`✖ ${findings.length} 个 must_fix 问题\n${text}`);
       await this.engineRun(P.fixPrompt({ findings: text, plan: this.run.plan }), `fix-r${round}`, 'fix');
       await this.autoCommitIfDirty(`ship: fix review round ${round}`);
@@ -210,25 +224,40 @@ export class Pipeline {
     }
   }
 
+  /** 双边独立审查：reviewEngines 里每个 engine 各自独立跑一遍，全部通过才算这一轮通过 */
   private async runReview(round: number): Promise<{ passed: boolean; findings: ReviewFinding[] }> {
-    const reviewJson = path.join(this.shipDir, 'review.json');
+    const results = await Promise.all(
+      this.cfg.reviewEngines.map((engineName) => this.runReviewWithEngine(engineName, round)),
+    );
+    const findings = results.flatMap((r) => r.findings);
+    const passed = results.every((r) => r.passed);
+    return { passed, findings };
+  }
+
+  private async runReviewWithEngine(
+    engineName: string,
+    round: number,
+  ): Promise<{ passed: boolean; findings: ReviewFinding[] }> {
+    const reviewJson = path.join(this.shipDir, `review-${engineName}.json`);
     fs.mkdirSync(this.shipDir, { recursive: true });
     fs.rmSync(reviewJson, { force: true });
     const prompt = P.reviewPrompt({ base: this.cfg.base, reviewJson, plan: this.run.plan });
-    await this.engineRun(prompt, `review-${round}`, 'review');
+    await this.engineRun(prompt, `review-${round}-${engineName}`, 'review', engineName);
     if (!fs.existsSync(reviewJson)) {
-      this.log('⚠ 审查者没有写出 review.json，重试一次');
-      await this.engineRun(prompt, `review-${round}-retry`, 'review');
+      this.log(`⚠ ${engineName} 审查者没有写出 review.json，重试一次`);
+      await this.engineRun(prompt, `review-${round}-${engineName}-retry`, 'review', engineName);
     }
     if (!fs.existsSync(reviewJson))
-      throw new Halt('blocked', '审查者两次都未产出 review.json，需要人工介入');
+      throw new Halt(`${engineName} 审查者两次都未产出 review.json，运行终止`);
     let verdict: { pass?: boolean; findings?: ReviewFinding[] };
     try {
       verdict = JSON.parse(fs.readFileSync(reviewJson, 'utf8'));
     } catch (e) {
-      throw new Halt('blocked', `review.json 不是合法 JSON：${e}`);
+      throw new Halt(`${engineName} 的 review.json 不是合法 JSON：${e}`);
     }
-    const findings = (verdict.findings ?? []).filter((f) => f.must_fix !== false);
+    const findings = (verdict.findings ?? [])
+      .filter((f) => f.must_fix !== false)
+      .map((f) => ({ ...f, reviewer: engineName }));
     return { passed: Boolean(verdict.pass) && findings.length === 0, findings };
   }
 
@@ -238,7 +267,7 @@ export class Pipeline {
     const branch = this.run.branch!;
     let r = await git(this.repo, 'push', '-u', 'origin', branch);
     if (r.code !== 0) r = await git(this.repo, 'push', '--force-with-lease', 'origin', branch);
-    if (r.code !== 0) throw new Halt('blocked', `push 失败：${r.out}`);
+    if (r.code !== 0) throw new Halt(`push 失败：${r.out}`);
     this.log('✔ 已 push');
 
     const view = await gh(this.repo, 'pr', 'view', '--json', 'url', '-q', '.url');
@@ -258,8 +287,7 @@ export class Pipeline {
     const created = await gh(this.repo, 'pr', 'create', '--base', this.cfg.base, '--title', title, '--body', body);
     if (created.code !== 0)
       throw new Halt(
-        'blocked',
-        `gh pr create 失败（gh 未装/未登录/remote 不是 GitHub？）：${created.out}\n分支已 push，处理好后 continue`,
+        `gh pr create 失败（gh 未装/未登录/remote 不是 GitHub？）：${created.out}\n分支已 push，运行终止`,
       );
     this.run.prUrl = created.out.split('\n').pop() ?? null;
     this.store.save(this.run);
@@ -293,10 +321,10 @@ export class Pipeline {
       let r = await git(this.repo, 'push', 'origin', this.run.branch!);
       if (r.code !== 0) {
         r = await git(this.repo, 'push', '--force-with-lease', 'origin', this.run.branch!);
-        if (r.code !== 0) throw new Halt('blocked', `push 失败：${r.out}`);
+        if (r.code !== 0) throw new Halt(`push 失败：${r.out}`);
       }
     }
-    throw new Halt('blocked', `CI 修复达到上限 ${this.cfg.maxCiRounds} 轮仍未绿，需要人工介入`);
+    throw new Halt(`CI 修复达到上限 ${this.cfg.maxCiRounds} 轮仍未绿，运行终止`);
   }
 
   private async resolveConflictsIfAny() {
@@ -307,18 +335,30 @@ export class Pipeline {
     const r = await git(this.repo, 'rebase', `origin/${this.cfg.base}`);
     if (r.code !== 0) {
       await this.engineRun(P.conflictPrompt({ base: this.cfg.base, plan: this.run.plan }), 'conflicts', 'conflict');
+      const gitDir = await this.gitDir();
       const midRebase =
-        fs.existsSync(path.join(this.repo, '.git', 'rebase-merge')) ||
-        fs.existsSync(path.join(this.repo, '.git', 'rebase-apply'));
+        fs.existsSync(path.join(gitDir, 'rebase-merge')) || fs.existsSync(path.join(gitDir, 'rebase-apply'));
       if (midRebase) {
         await git(this.repo, 'rebase', '--abort');
-        throw new Halt('blocked', 'engine 未能完成冲突解决，已 rebase --abort 恢复现场，需要人工处理');
+        throw new Halt('engine 未能完成冲突解决，已 rebase --abort 恢复现场，运行终止');
       }
     }
     await this.gateTests();
     const push = await git(this.repo, 'push', '--force-with-lease', 'origin', this.run.branch!);
-    if (push.code !== 0) throw new Halt('blocked', `冲突解决后 push 失败：${push.out}`);
+    if (push.code !== 0) throw new Halt(`冲突解决后 push 失败：${push.out}`);
     this.log('✔ 冲突已解决并推送');
+  }
+
+  /**
+   * CI 已确认全绿后自动合并 PR：squash 到 base。
+   * 不带 --delete-branch：分支这时还在 worktree 里检出着，gh 删分支会跟这个冲突；
+   * worktree 在 cleanup 阶段统一删（那时分支已经不在任何 worktree 里检出了）。
+   */
+  private async stageMerge() {
+    this.log('阶段 merge：CI 已过，自动合并 PR');
+    const r = await gh(this.repo, 'pr', 'merge', '--squash');
+    if (r.code !== 0) throw new Halt(`自动合并 PR 失败：${r.out}`);
+    this.log('✔ PR 已自动合并（squash）');
   }
 
   // ---------------------------------------------------------- gates & engine
@@ -355,7 +395,7 @@ export class Pipeline {
         return;
       }
       if (attempt === this.cfg.maxFixRounds)
-        throw new Halt('blocked', `测试修复 ${attempt} 轮后仍失败，需要人工介入。最后输出：\n${r.out.slice(-3000)}`);
+        throw new Halt(`测试修复 ${attempt} 轮后仍失败，运行终止。最后输出：\n${r.out.slice(-3000)}`);
       this.log(`✖ 测试失败（第 ${attempt + 1} 次），交给 engine 修复`);
       await this.engineRun(
         P.testFixPrompt({ testCmd: cmd, output: r.out.slice(-6000) }),
@@ -374,11 +414,15 @@ export class Pipeline {
     this.log(`⚠ engine 留下未提交改动，已代为提交（${msg}）`);
   }
 
-  /** 调 LLM engine 做一步，输出全程落盘并实时推事件。kind 用于 stageEngines 按步骤路由引擎 */
-  private async engineRun(prompt: string, label: string, kind: StepKind): Promise<number> {
-    const engineName = this.cfg.stageEngines?.[kind] ?? this.cfg.engine;
+  /**
+   * 调 LLM engine 做一步，输出全程落盘并实时推事件。
+   * kind 用于 stageEngines 按步骤路由引擎；engineOverride 显式指定时优先于 kind 路由
+   * （双边审查用它分别点名 reviewEngines 里的每个 engine）。
+   */
+  private async engineRun(prompt: string, label: string, kind: StepKind, engineOverride?: string): Promise<number> {
+    const engineName = engineOverride ?? this.cfg.stageEngines?.[kind] ?? this.cfg.engine;
     const spec = this.cfg.engines[engineName];
-    if (!spec) throw new Halt('blocked', `未知 engine: ${engineName}（步骤 ${kind}）`);
+    if (!spec) throw new Halt(`未知 engine: ${engineName}（步骤 ${kind}）`);
 
     const logsDir = path.join(this.store.runDir(this.run.id), 'engine-logs');
     fs.mkdirSync(logsDir, { recursive: true });

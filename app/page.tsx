@@ -3,20 +3,19 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import type { GroupRecord, RunEvent, RunRecord } from '@/lib/types';
 
-const STAGES = ['branch', 'implement', 'autoReview', 'humanReview', 'pr', 'ci', 'done'] as const;
+const STAGES = ['worktree', 'implement', 'autoReview', 'pr', 'ci', 'done'] as const;
 const STAGE_LABEL: Record<string, string> = {
-  branch: '建分支', implement: '实现', autoReview: 'LLM 审查',
-  humanReview: '人工 Review', pr: '提 PR', ci: 'CI/冲突', done: '完成',
+  worktree: '建 Worktree', implement: '实现', autoReview: '双边审查',
+  pr: '提 PR', ci: 'CI/冲突', done: '完成',
 };
-// run 与 group 状态共用一套标签（组状态是 running/awaiting_review/blocked/done 的子集）
+// run 与 group 状态共用一套标签（组状态是 running/failed/done 的子集）
 const STATUS_LABEL: Record<string, string> = {
-  running: '进行中', awaiting_review: '等待人工 Review',
-  blocked: '需人工处理', failed: '失败', done: '完成·等人工合并',
+  running: '进行中', failed: '已终止', done: '完成·PR 已自动合并',
 };
 
 /** 组状态标签（比单 run 略简） */
 const GROUP_STATUS_LABEL: Record<string, string> = {
-  running: '推进中', awaiting_review: '有成员待 Review', blocked: '有成员需处理', done: '全部完成',
+  running: '推进中', failed: '有成员已终止', done: '全部完成',
 };
 
 /** 取路径最后一段目录名 */
@@ -112,11 +111,6 @@ export default function Page() {
   const [tab, setTab] = useState<'log' | 'diff' | 'findings' | 'plan'>('log');
   const [groupTab, setGroupTab] = useState<'diff' | 'findings' | 'plan'>('diff');
   const logRef = useRef<HTMLDivElement>(null);
-  const rejectRef = useRef<HTMLDialogElement>(null);
-  const groupRejectRef = useRef<HTMLDialogElement>(null);
-  const [rejectText, setRejectText] = useState('');
-  const [groupRejectText, setGroupRejectText] = useState('');
-  const [rejectChecks, setRejectChecks] = useState<Record<string, boolean>>({});
   const runIdRef = useRef<string | null>(null);
   const groupIdRef = useRef<string | null>(null);
 
@@ -239,68 +233,14 @@ export default function Page() {
     if (el) el.scrollTop = el.scrollHeight;
   }, [lines, tab]);
 
-  const act = async (action: string, body?: unknown) => {
-    if (!run) return;
-    const res = await fetch(`/api/runs/${run.id}/${action}`, {
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: body ? JSON.stringify(body) : undefined,
-    });
-    if (!res.ok) alert((await res.json()).error);
-    refreshRun(run.id);
-    loadRuns();
-  };
-
-  const submitReject = () => {
-    const fb = rejectText.trim();
-    if (fb) act('reject', { feedback: fb });
-    rejectRef.current?.close();
-  };
-
-  // ---------- 组操作 ----------
-  const groupApprove = async () => {
-    if (!group) return;
-    const res = await fetch(`/api/groups/${group.group.id}/approve`, { method: 'POST' });
-    if (!res.ok) alert((await res.json()).error);
-    refreshGroup(group.group.id);
-    loadRuns();
-  };
-
-  // 打回对话框默认全组勾选；running 成员不可勾选
-  const openGroupReject = () => {
-    if (!group) return;
-    const init: Record<string, boolean> = {};
-    for (const r of group.runs) init[r.id] = r.status !== 'running';
-    setRejectChecks(init);
-    setGroupRejectText('');
-    groupRejectRef.current?.showModal();
-  };
-
-  const submitGroupReject = async () => {
-    if (!group) return;
-    const fb = groupRejectText.trim();
-    const runIds = Object.entries(rejectChecks).filter(([, v]) => v).map(([k]) => k);
-    if (!fb || !runIds.length) return;
-    const res = await fetch(`/api/groups/${group.group.id}/reject`, {
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ feedback: fb, runIds }),
-    });
-    if (!res.ok) alert((await res.json()).error);
-    groupRejectRef.current?.close();
-    refreshGroup(group.group.id);
-    loadRuns();
-  };
-
   const stageIdx = run ? STAGES.indexOf(run.stage) : -1;
-  const groupCanApprove = group?.runs.some((r) => r.status === 'awaiting_review') ?? false;
 
   return (
     <div className="app">
       <aside className="sidebar">
         <header>
           <h1>⛵ ship</h1>
-          <span className="sub">方案 → PR 交付流水线 · 本地</span>
+          <span className="sub">方案 → 自动合并 PR · 全自动 · 本地</span>
         </header>
         <div className="run-list">
           {runs.length === 0 && groups.length === 0 && (
@@ -396,15 +336,6 @@ export default function Page() {
               </tbody>
             </table>
 
-            <div className="group-ops">
-              <button className="btn primary" disabled={!groupCanApprove} onClick={groupApprove}>
-                ✓ 整组通过
-              </button>
-              <button className="btn danger" onClick={openGroupReject}>
-                ⟲ 打回…
-              </button>
-            </div>
-
             <nav className="tabs">
               {(['diff', 'findings', 'plan'] as const).map((t) => (
                 <button key={t} className={groupTab === t ? 'active' : ''} onClick={() => setGroupTab(t)}>
@@ -440,8 +371,8 @@ export default function Page() {
                 )}
                 <h2>{run.title}</h2>
                 <div className="meta">
-                  {run.repoPath} · {run.branch ?? '(分支未建)'} → {run.config.base} · engine:{' '}
-                  {run.config.engine}
+                  {run.repoPath} · {run.branch ?? '(worktree 未建)'} → {run.config.base} · engine:{' '}
+                  {run.config.engine} · review: {run.config.reviewEngines.join('+')}
                 </div>
               </div>
               <span className={`badge ${run.status}`}>{STATUS_LABEL[run.status] ?? run.status}</span>
@@ -461,40 +392,13 @@ export default function Page() {
             {run.status !== 'running' && (
               <div className={`banner ${run.status}`}>
                 <div className="detail-text">{run.statusDetail || STATUS_LABEL[run.status]}</div>
-                <div className="actions">
-                  {run.status === 'awaiting_review' && (
-                    <>
-                      <button className="btn primary" onClick={() => act('approve')}>
-                        ✓ 通过，去提 PR
-                      </button>
-                      <button className="btn danger" onClick={() => rejectRef.current?.showModal()}>
-                        ⟲ 打回
-                      </button>
-                    </>
-                  )}
-                  {(run.status === 'blocked' || run.status === 'failed') && (
-                    <>
-                      <button className="btn primary" onClick={() => act('continue')}>
-                        继续
-                      </button>
-                      <button className="btn danger" onClick={() => rejectRef.current?.showModal()}>
-                        ⟲ 打回
-                      </button>
-                    </>
-                  )}
-                  {run.status === 'done' && (
-                    <>
-                      {run.prUrl && (
-                        <a className="btn primary" href={run.prUrl} target="_blank">
-                          打开 PR 合并 ↗
-                        </a>
-                      )}
-                      <button className="btn danger" onClick={() => rejectRef.current?.showModal()}>
-                        ⟲ 还有问题，打回
-                      </button>
-                    </>
-                  )}
-                </div>
+                {run.status === 'done' && run.prUrl && (
+                  <div className="actions">
+                    <a className="btn primary" href={run.prUrl} target="_blank">
+                      查看已合并的 PR ↗
+                    </a>
+                  </div>
+                )}
               </div>
             )}
 
@@ -524,60 +428,6 @@ export default function Page() {
           </div>
         )}
       </main>
-
-      <dialog ref={rejectRef}>
-        <h3>打回意见</h3>
-        <textarea
-          rows={6}
-          value={rejectText}
-          onChange={(e) => setRejectText(e.target.value)}
-          placeholder="说明哪里不行、期望改成什么样。会交给 engine 修复后重新进入复审循环。"
-        />
-        <div className="dialog-actions">
-          <button className="btn" onClick={() => rejectRef.current?.close()}>
-            取消
-          </button>
-          <button className="btn danger" onClick={submitReject}>
-            打回
-          </button>
-        </div>
-      </dialog>
-
-      <dialog ref={groupRejectRef}>
-        <h3>联动打回</h3>
-        <textarea
-          rows={5}
-          value={groupRejectText}
-          onChange={(e) => setGroupRejectText(e.target.value)}
-          placeholder="说明哪里不行、期望改成什么样。会给勾选的成员注入意见（带 [联动打回] 前缀），各自修复→复审→回到人工门禁。"
-        />
-        <div className="reject-members">
-          {group?.runs.map((r) => {
-            const running = r.status === 'running';
-            return (
-              <label key={r.id} className={`reject-member${running ? ' disabled' : ''}`}>
-                <input
-                  type="checkbox"
-                  disabled={running}
-                  checked={!!rejectChecks[r.id]}
-                  onChange={(e) => setRejectChecks((prev) => ({ ...prev, [r.id]: e.target.checked }))}
-                />
-                <span className="mname">{dirName(r.repoPath)}</span>
-                <span className={`badge ${r.status}`}>{STATUS_LABEL[r.status] ?? r.status}</span>
-                {running && <span className="hint">推进中</span>}
-              </label>
-            );
-          })}
-        </div>
-        <div className="dialog-actions">
-          <button className="btn" onClick={() => groupRejectRef.current?.close()}>
-            取消
-          </button>
-          <button className="btn danger" onClick={submitGroupReject}>
-            打回
-          </button>
-        </div>
-      </dialog>
     </div>
   );
 }

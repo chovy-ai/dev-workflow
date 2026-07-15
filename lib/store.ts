@@ -34,10 +34,12 @@ export class Store {
       if (!fs.existsSync(f)) continue;
       try {
         const run = JSON.parse(fs.readFileSync(f, 'utf8')) as RunRecord;
-        // server 重启时不可能还有推进中的流水线，统一归为 blocked，可 continue
+        // server 重启时不可能还有推进中的流水线；没有 continue 机制，直接判为失败，需重新 ship start
         if (run.status === 'running') {
-          run.status = 'blocked';
-          run.statusDetail = 'server 重启导致中断，可从当前阶段继续';
+          run.status = 'failed';
+          run.statusDetail = run.worktreePath
+            ? `server 重启导致中断，运行终止，请重新发起（worktree 未自动清理，需要手动 git worktree remove ${run.worktreePath}）`
+            : 'server 重启导致中断，运行终止，请重新发起';
         }
         this.runs.set(id, run);
         this.seqs.set(id, this.lastSeq(id));
@@ -79,13 +81,6 @@ export class Store {
 
   get(id: string): RunRecord | undefined {
     return this.runs.get(id);
-  }
-
-  /** 是否已有同仓库的未完成运行（一个仓库同时只允许一条流水线） */
-  activeRunForRepo(repoPath: string): RunRecord | undefined {
-    return this.list().find(
-      (r) => r.repoPath === repoPath && r.status !== 'done' && r.status !== 'failed',
-    );
   }
 
   save(run: RunRecord) {

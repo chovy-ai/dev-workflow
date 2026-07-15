@@ -37,23 +37,17 @@ export function isAdvancing(runId: string): boolean {
 }
 
 /**
- * 单仓创建前置校验（是 git 仓库、无进行中 run）。
- * 组创建与单仓创建共用这套校验，保证组的原子创建与单仓语义一致。
+ * 单仓创建前置校验（是 git 仓库）。组创建与单仓创建共用这套校验，保证组的原子创建与单仓语义一致。
  * 通过则返回 git toplevel 路径。
+ * 同仓库允许多条 run 并行——每条 run 各自建独立 worktree，互不碰原仓库工作目录；
+ * 分支名带随机后缀（见 pipeline.branchName），避免并行 run 撞名。
  */
 export async function validateRepoForRun(
   repoPath: string,
 ): Promise<{ repo?: string; error?: string; status: number }> {
   const top = await git(repoPath, 'rev-parse', '--show-toplevel');
   if (top.code !== 0) return { error: `${repoPath} 不是 git 仓库`, status: 400 };
-  const repo = top.out;
-  const existing = getStore().activeRunForRepo(repo);
-  if (existing)
-    return {
-      error: `${repoPath} 已有进行中的运行 ${existing.id}（一个仓库同时只跑一条流水线）`,
-      status: 409,
-    };
-  return { repo, status: 200 };
+  return { repo: top.out, status: 200 };
 }
 
 /** 组装 run 配置：请求体 > 仓库 ship.config.json > 默认 */
@@ -76,13 +70,24 @@ function buildConfig(repo: string, override?: Partial<RunConfig>): RunConfig {
   return config;
 }
 
-/** 落盘一条新 run 并异步推进（repo 须已通过 validateRepoForRun 校验、为 git toplevel） */
+/** 配置里引用了未定义的 engine 名则返回错误文案（创建时拦截，别等跑到一半才 Halt） */
+function unknownEngineError(config: RunConfig): string | null {
+  const referenced = [
+    config.engine,
+    ...Object.values(config.stageEngines ?? {}),
+    ...config.reviewEngines,
+  ];
+  const bad = referenced.find((n) => !config.engines[n]);
+  return bad ? `未知 engine：${bad}（可用：${Object.keys(config.engines).join(' / ')}）` : null;
+}
+
+/** 落盘一条新 run 并异步推进（repo 须已通过 validateRepoForRun 校验、config 已 buildConfig+校验） */
 function startRun(input: {
   repo: string;
   plan: string;
   title?: string;
   groupId?: string;
-  config?: Partial<RunConfig>;
+  config: RunConfig;
 }): RunRecord {
   const store = getStore();
   const now = new Date().toISOString();
@@ -92,19 +97,19 @@ function startRun(input: {
     title: input.title ?? firstLine?.replace(/^#+\s*/, '').slice(0, 60) ?? 'ship run',
     repoPath: input.repo,
     branch: null,
+    worktreePath: null,
     groupId: input.groupId,
     plan: input.plan,
-    stage: 'branch',
+    stage: 'worktree',
     status: 'running',
     statusDetail: '',
     reviewRound: 0,
-    feedback: [],
     findings: [],
     prUrl: null,
     sdkSessions: {},
     createdAt: now,
     updatedAt: now,
-    config: buildConfig(input.repo, input.config),
+    config: input.config,
   };
   store.save(run);
   store.event(run, 'log', { msg: `运行创建：${run.title}（${input.repo}）` });
@@ -120,7 +125,10 @@ export async function createRun(input: {
 }): Promise<{ run?: RunRecord; error?: string; status: number }> {
   const { repo, error, status } = await validateRepoForRun(input.repoPath);
   if (!repo) return { error, status };
-  const run = startRun({ repo, plan: input.plan, title: input.title, config: input.config });
+  const config = buildConfig(repo, input.config);
+  const engineErr = unknownEngineError(config);
+  if (engineErr) return { error: engineErr, status: 400 };
+  const run = startRun({ repo, plan: input.plan, title: input.title, config });
   return { run, status: 201 };
 }
 
@@ -131,20 +139,23 @@ export async function createRun(input: {
  */
 export async function createGroup(input: {
   title: string;
-  repos: { repoPath: string; plan: string }[];
+  repos: { repoPath: string; plan: string; config?: Partial<RunConfig> }[];
 }): Promise<{ group?: GroupRecord; runs?: RunRecord[]; error?: string; status: number }> {
   const store = getStore();
   if (!input.repos.length) return { error: '组至少需要一个仓库', status: 400 };
 
-  // 1. 原子校验：所有仓库先过一遍（含组内去重），任一失败整组不创建
-  const resolved: { repo: string; plan: string }[] = [];
+  // 1. 原子校验：所有仓库先过一遍（含组内去重、engine 名校验），任一失败整组不创建
+  const resolved: { repo: string; plan: string; config: RunConfig }[] = [];
   const seen = new Set<string>();
   for (const item of input.repos) {
     const { repo, error, status } = await validateRepoForRun(item.repoPath);
     if (!repo) return { error, status };
     if (seen.has(repo)) return { error: `${item.repoPath} 在组内重复出现`, status: 400 };
     seen.add(repo);
-    resolved.push({ repo, plan: item.plan });
+    const config = buildConfig(repo, item.config);
+    const engineErr = unknownEngineError(config);
+    if (engineErr) return { error: `${item.repoPath}: ${engineErr}`, status: 400 };
+    resolved.push({ repo, plan: item.plan, config });
   }
 
   // 2. 创建组 + 逐仓创建 run
@@ -155,7 +166,7 @@ export async function createGroup(input: {
     createdAt: new Date().toISOString(),
   };
   const runs = resolved.map((item) => {
-    const run = startRun({ repo: item.repo, plan: item.plan, groupId: group.id });
+    const run = startRun({ repo: item.repo, plan: item.plan, groupId: group.id, config: item.config });
     group.runIds.push(run.id);
     return run;
   });

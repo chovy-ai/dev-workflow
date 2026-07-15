@@ -1,10 +1,9 @@
 // 共享类型：server / cli / web(经 JSON) 都以此为准
 
 export const STAGES = [
-  'branch',
+  'worktree',
   'implement',
   'autoReview',
-  'humanReview',
   'pr',
   'ci',
   'done',
@@ -12,13 +11,12 @@ export const STAGES = [
 export type StageName = (typeof STAGES)[number];
 
 /**
- * running          流水线推进中
- * awaiting_review  停在人工 review 门禁，等 web 上 通过/打回
- * blocked          需要人工决策/环境处理（熔断、gh 缺失等），可 continue 续跑
- * failed           意外错误
- * done             全部完成，等人工合并 PR
+ * running  流水线推进中（含内部 review/测试/CI 修复循环，全自动，无暂停点）
+ * failed   遇到无法自动恢复的问题（环境问题，或修复循环达到轮数上限），运行终止；
+ *          没有 continue：需要人处理好环境后重新 `ship start`
+ * done     全自动跑完：LLM review 通过、测试/CI 绿、PR 已自动合并
  */
-export type RunStatus = 'running' | 'awaiting_review' | 'blocked' | 'failed' | 'done';
+export type RunStatus = 'running' | 'failed' | 'done';
 
 /**
  * 引擎规格：
@@ -60,19 +58,26 @@ export interface RunConfig {
   engines: Record<string, EngineSpec>;
   /**
    * 按步骤类型覆盖引擎，不配则用默认 engine。
-   * 典型用法：跨厂商交叉审查（claude 实现、codex 审查），避免模型审自己代码的盲区。
-   * key: implement | review | fix | testFix | ciFix | conflict
+   * key: implement | fix | testFix | ciFix | conflict（review 不走这里，见 reviewEngines）
    */
   stageEngines?: Partial<Record<StepKind, string>>;
+  /**
+   * autoReview 阶段双边独立审查的引擎名列表，默认 ['claude', 'codex']——两边跨厂商各自独立审查，
+   * 都通过（pass=true 且无 must_fix）才算这一轮过；任一方打回都要修复后重新双边复审。
+   * 没有人工兜底了，双边审查是唯一的质量把关。
+   */
+  reviewEngines: string[];
 }
 
-/** engine 调用的步骤类型（用于 stageEngines 路由） */
+/** engine 调用的步骤类型（用于 stageEngines / reviewEngines 路由） */
 export type StepKind = 'implement' | 'review' | 'fix' | 'testFix' | 'ciFix' | 'conflict';
 
 export interface ReviewFinding {
   file: string;
   issue: string;
   must_fix: boolean;
+  /** 哪个 engine 提出的这条发现（双边审查下用于区分来源） */
+  reviewer?: string;
 }
 
 export interface RunRecord {
@@ -80,15 +85,16 @@ export interface RunRecord {
   title: string;
   repoPath: string;
   branch: string | null;
+  /** git worktree 的绝对路径；worktree 阶段建好后才有值，运行终态后清理为 null */
+  worktreePath: string | null;
   /** 所属运行组（run group）id；无组的单仓运行不带此字段 */
   groupId?: string;
   plan: string;
   stage: StageName;
   status: RunStatus;
-  /** status 的补充说明（阻塞原因等） */
+  /** status 的补充说明（失败原因等） */
   statusDetail: string;
   reviewRound: number;
-  feedback: string[];
   /** 最近一轮 LLM 审查的 must_fix 发现（给 web 展示） */
   findings: ReviewFinding[];
   prUrl: string | null;
@@ -118,18 +124,16 @@ export interface GroupRecord {
 
 /**
  * 组状态（推导，不落盘）：
- * running          有成员推进中
- * blocked          无推进中，但有成员 blocked / failed
- * awaiting_review  无推进中/阻塞，但有成员等人工 review
- * done             全部完成
+ * running  有成员推进中
+ * failed   无推进中，但有成员 failed
+ * done     全部完成
  */
-export type GroupStatus = 'running' | 'blocked' | 'awaiting_review' | 'done';
+export type GroupStatus = 'running' | 'failed' | 'done';
 
 /** 从成员 run 推导组状态（供 API 与 web 复用）。空成员按 done 处理。 */
 export function deriveGroupStatus(runs: RunRecord[]): GroupStatus {
   if (runs.some((r) => r.status === 'running')) return 'running';
-  if (runs.some((r) => r.status === 'blocked' || r.status === 'failed')) return 'blocked';
-  if (runs.some((r) => r.status === 'awaiting_review')) return 'awaiting_review';
+  if (runs.some((r) => r.status === 'failed')) return 'failed';
   return 'done';
 }
 
@@ -154,9 +158,11 @@ export const DEFAULT_CONFIG: RunConfig = {
   engine: 'claude',
   base: 'main',
   testCmd: null,
-  maxReviewRounds: 3,
-  maxCiRounds: 3,
-  maxFixRounds: 3,
+  // 没有人工兜底了，熔断前多给几轮自动修复的机会再放弃
+  maxReviewRounds: 5,
+  maxCiRounds: 5,
+  maxFixRounds: 5,
+  reviewEngines: ['claude', 'codex'],
   engines: {
     // 默认走各家官方 SDK（进程内、流式、会话续传）；-cli 变体是外部命令后备
     claude: { type: 'claude-sdk' },
