@@ -10,12 +10,61 @@ import { git } from './exec';
  * Next.js 开发模式会按需重编译模块；用 globalThis 缓存保证
  * Store（含事件总线）与推进锁在整个 node 进程内是同一份。
  */
-type G = typeof globalThis & { __shipStore?: Store; __shipAdvancing?: Set<string> };
+type G = typeof globalThis & { __shipStore?: Store; __shipAdvancing?: Set<string>; __shipBooted?: boolean };
 const g = globalThis as G;
+
+/** server 重启后自动续跑的次数上限：防止"续跑→再崩→再续跑"死循环 */
+const MAX_AUTO_RESUMES = 3;
+/** 每次启动补扫复盘的条数上限：避免积压的历史 run 一次性打爆 engine */
+const RETRO_SWEEP_LIMIT = 3;
 
 export function getStore(): Store {
   if (!g.__shipStore) g.__shipStore = new Store();
+  if (!g.__shipBooted) {
+    g.__shipBooted = true;
+    const store = g.__shipStore;
+    setTimeout(() => bootRecover(store), 0);
+  }
   return g.__shipStore;
+}
+
+/**
+ * 启动恢复：
+ * 1) 上个 server 进程中断时仍在推进的 run 自动续跑（状态机 stage / SDK 会话都已持久化，
+ *    worktree 被清了会从保留的分支重建；自动续跑超过上限才判失败）；
+ * 2) 复盘补扫：已终态但没总结过（无 retroAt）的 run 补跑 retro，保证"每条 run 都被总结过一次"。
+ */
+function bootRecover(store: Store) {
+  for (const id of store.interruptedAtLoad) {
+    const run = store.get(id);
+    if (!run || run.status !== 'running' || isAdvancing(id)) continue;
+    const resumes = (run.resumes ?? 0) + 1;
+    if (resumes > MAX_AUTO_RESUMES) {
+      run.status = 'failed';
+      run.statusDetail = `自动续跑达到上限 ${MAX_AUTO_RESUMES} 次仍被中断，运行终止（可手动 ship resume 再试）`;
+      store.save(run);
+      store.event(run, 'status', { status: run.status, detail: run.statusDetail });
+      continue;
+    }
+    run.resumes = resumes;
+    store.save(run);
+    store.event(run, 'log', { msg: `⟲ server 重启，自动续跑（第 ${resumes} 次，从阶段 ${run.stage} 继续）` });
+    advance(run);
+  }
+  void sweepRetro(store);
+}
+
+/** 复盘补扫：串行、每次启动最多 RETRO_SWEEP_LIMIT 条、只看最近 14 天（老账不追） */
+async function sweepRetro(store: Store) {
+  const cutoff = Date.now() - 14 * 86400_000;
+  const targets = store
+    .list()
+    .filter((r) => r.status !== 'running' && !r.retroAt && Date.parse(r.createdAt) > cutoff)
+    .slice(0, RETRO_SWEEP_LIMIT);
+  for (const run of targets) {
+    if (isAdvancing(run.id)) continue;
+    await new Pipeline(run, store).retroOnly();
+  }
 }
 
 function advancing(): Set<string> {
@@ -70,6 +119,17 @@ function buildConfig(repo: string, override?: Partial<RunConfig>): RunConfig {
   return config;
 }
 
+/**
+ * 同仓库已有「相同方案且还在跑」的 run 时拒绝重复创建——同一方案并行跑两份纯属烧算力
+ * （worktree 隔离下两份都能跑完，但只会合并出两个重复 PR）。方案不同的并行 run 不受影响。
+ */
+function duplicateRunError(repo: string, plan: string): string | null {
+  const dup = getStore()
+    .list()
+    .find((r) => r.repoPath === repo && r.status === 'running' && r.plan.trim() === plan.trim());
+  return dup ? `该仓库已有相同方案的 run 正在运行（${dup.id}），拒绝重复创建` : null;
+}
+
 /** 配置里引用了未定义的 engine 名则返回错误文案（创建时拦截，别等跑到一半才 Halt） */
 function unknownEngineError(config: RunConfig): string | null {
   const referenced = [
@@ -105,6 +165,7 @@ function startRun(input: {
     statusDetail: '',
     reviewRound: 0,
     findings: [],
+    advisories: [],
     prUrl: null,
     sdkSessions: {},
     createdAt: now,
@@ -115,6 +176,25 @@ function startRun(input: {
   store.event(run, 'log', { msg: `运行创建：${run.title}（${input.repo}）` });
   advance(run);
   return run;
+}
+
+/**
+ * 手动续跑：中断/失败的 run 从持久化的 stage 继续（worktree 没了就从保留的分支重建）。
+ * 与自动续跑不同，手动是人的明确意图，不受 MAX_AUTO_RESUMES 限制。
+ */
+export function resumeRun(id: string): { run?: RunRecord; error?: string; status: number } {
+  const store = getStore();
+  const run = store.get(id);
+  if (!run) return { error: `run 不存在：${id}`, status: 404 };
+  if (run.status === 'done') return { error: '已完成的 run 不能续跑', status: 400 };
+  if (isAdvancing(id)) return { error: '该 run 正在推进中，无需续跑', status: 409 };
+  run.resumes = (run.resumes ?? 0) + 1;
+  run.status = 'running';
+  run.statusDetail = '';
+  store.save(run);
+  store.event(run, 'log', { msg: `⟲ 手动续跑（从阶段 ${run.stage} 继续）` });
+  advance(run);
+  return { run, status: 200 };
 }
 
 export async function createRun(input: {
@@ -128,6 +208,8 @@ export async function createRun(input: {
   const config = buildConfig(repo, input.config);
   const engineErr = unknownEngineError(config);
   if (engineErr) return { error: engineErr, status: 400 };
+  const dupErr = duplicateRunError(repo, input.plan);
+  if (dupErr) return { error: dupErr, status: 409 };
   const run = startRun({ repo, plan: input.plan, title: input.title, config });
   return { run, status: 201 };
 }
@@ -155,6 +237,8 @@ export async function createGroup(input: {
     const config = buildConfig(repo, item.config);
     const engineErr = unknownEngineError(config);
     if (engineErr) return { error: `${item.repoPath}: ${engineErr}`, status: 400 };
+    const dupErr = duplicateRunError(repo, item.plan);
+    if (dupErr) return { error: `${item.repoPath}: ${dupErr}`, status: 409 };
     resolved.push({ repo, plan: item.plan, config });
   }
 

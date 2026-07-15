@@ -1,8 +1,9 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
+import crypto from 'node:crypto';
 import { EventEmitter } from 'node:events';
-import type { GroupRecord, RunEvent, RunEventType, RunRecord } from './types';
+import type { GroupRecord, PendingLesson, RunEvent, RunEventType, RunRecord } from './types';
 
 /**
  * 持久化布局（SHIP_HOME，默认 ~/.ship-server）：
@@ -10,6 +11,8 @@ import type { GroupRecord, RunEvent, RunEventType, RunRecord } from './types';
  *   runs/<id>/events.ndjson   事件流（web/cli 回放 + 实时推送的数据源）
  *   runs/<id>/engine-logs/    每次 engine 调用的完整输出
  *   groups/<id>/group.json    运行组（纯聚合层，状态不落盘、实时推导）
+ *   knowledge/<repo-hash>/pending.ndjson  复盘经验暂存区：run 终态后先落这里，
+ *                             由同仓库下一条 run 同步进仓库 ship.lessons.md（进 git）后清理
  */
 export class Store {
   readonly root: string;
@@ -18,6 +21,8 @@ export class Store {
   private seqs = new Map<string, number>();
   /** 实时事件总线：emit(runId, event) */
   readonly bus = new EventEmitter();
+  /** 加载时仍处于 running 的 run（上个 server 进程被中断）——由 runtime 启动时自动续跑 */
+  readonly interruptedAtLoad: string[] = [];
 
   constructor(root?: string) {
     this.root = root ?? process.env.SHIP_HOME ?? path.join(os.homedir(), '.ship-server');
@@ -34,13 +39,9 @@ export class Store {
       if (!fs.existsSync(f)) continue;
       try {
         const run = JSON.parse(fs.readFileSync(f, 'utf8')) as RunRecord;
-        // server 重启时不可能还有推进中的流水线；没有 continue 机制，直接判为失败，需重新 ship start
-        if (run.status === 'running') {
-          run.status = 'failed';
-          run.statusDetail = run.worktreePath
-            ? `server 重启导致中断，运行终止，请重新发起（worktree 未自动清理，需要手动 git worktree remove ${run.worktreePath}）`
-            : 'server 重启导致中断，运行终止，请重新发起';
-        }
+        // 上个 server 进程中断时仍在推进的 run：状态保留 running，交由 runtime 启动时自动续跑
+        // （状态机 stage/sdk 会话都在 run.json 里，天然可从断点继续；续跑次数超限才判失败）
+        if (run.status === 'running') this.interruptedAtLoad.push(id);
         this.runs.set(id, run);
         this.seqs.set(id, this.lastSeq(id));
       } catch {
@@ -118,6 +119,52 @@ export class Store {
     fs.appendFileSync(path.join(this.runDir(run.id), 'events.ndjson'), JSON.stringify(ev) + '\n');
     this.bus.emit('event', run.id, ev);
     return ev;
+  }
+
+  // ---------------------------------------------------------- knowledge（复盘经验暂存区 + 已总结台账）
+
+  private knowledgeDir(repoPath: string): string {
+    const hash = crypto.createHash('sha1').update(repoPath).digest('hex').slice(0, 12);
+    const dir = path.join(this.root, 'knowledge', hash);
+    fs.mkdirSync(dir, { recursive: true });
+    return dir;
+  }
+
+  private knowledgeFile(repoPath: string): string {
+    return path.join(this.knowledgeDir(repoPath), 'pending.ndjson');
+  }
+
+  /** 已总结台账：哪些 run id 复盘过、何时、提炼了几条（run.json 的 retroAt 是判定源，这里是集中可查的账本） */
+  appendSummarized(repoPath: string, entry: { runId: string; ts: string; lessons: number }) {
+    fs.appendFileSync(path.join(this.knowledgeDir(repoPath), 'summarized.ndjson'), JSON.stringify(entry) + '\n');
+  }
+
+  pendingLessons(repoPath: string): PendingLesson[] {
+    const f = this.knowledgeFile(repoPath);
+    if (!fs.existsSync(f)) return [];
+    const out: PendingLesson[] = [];
+    for (const line of fs.readFileSync(f, 'utf8').split('\n')) {
+      if (!line.trim()) continue;
+      try {
+        out.push(JSON.parse(line) as PendingLesson);
+      } catch {
+        /* 跳过坏行 */
+      }
+    }
+    return out;
+  }
+
+  appendPendingLessons(repoPath: string, lessons: PendingLesson[]) {
+    if (!lessons.length) return;
+    fs.appendFileSync(this.knowledgeFile(repoPath), lessons.map((l) => JSON.stringify(l)).join('\n') + '\n');
+  }
+
+  /** 用过滤后的集合整体重写暂存区（同步进仓库文件后清理已落盘条目用） */
+  rewritePendingLessons(repoPath: string, lessons: PendingLesson[]) {
+    fs.writeFileSync(
+      this.knowledgeFile(repoPath),
+      lessons.length ? lessons.map((l) => JSON.stringify(l)).join('\n') + '\n' : '',
+    );
   }
 
   readEvents(id: string, afterSeq = 0): RunEvent[] {

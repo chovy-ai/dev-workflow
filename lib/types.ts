@@ -63,14 +63,36 @@ export interface RunConfig {
   stageEngines?: Partial<Record<StepKind, string>>;
   /**
    * autoReview 阶段双边独立审查的引擎名列表，默认 ['claude', 'codex']——两边跨厂商各自独立审查，
-   * 都通过（pass=true 且无 must_fix）才算这一轮过；任一方打回都要修复后重新双边复审。
+   * 都通过（pass=true 且无 must_fix）才算这一轮过；任一方打回都要修复后复审。
+   * 第 1 轮全量审查（分支累计 diff）；第 2 轮起为复审：打回方复核旧意见 + 修复增量，
+   * 放行方只扫修复增量，must_fix 只能来自「旧意见未修好」或「增量新问题」，旧范围新发现降级 advisory。
    * 没有人工兜底了，双边审查是唯一的质量把关。
    */
   reviewEngines: string[];
 }
 
 /** engine 调用的步骤类型（用于 stageEngines / reviewEngines 路由） */
-export type StepKind = 'implement' | 'review' | 'fix' | 'testFix' | 'ciFix' | 'conflict';
+export type StepKind = 'implement' | 'review' | 'fix' | 'testFix' | 'ciFix' | 'conflict' | 'retro';
+
+/**
+ * 复盘经验：run 终态后由 retro 步骤提炼，先暂存在 SHIP_HOME/knowledge/，
+ * 由同仓库的下一条 run 同步进仓库根的 ship.lessons.md（进 git、团队共享），
+ * 并注入后续 run 的 implement / 全量审查 prompt 作为避坑上下文。
+ */
+export interface Lesson {
+  /** plan | implement | review | test | ci | harness */
+  type: string;
+  /** 一句话说清可复用的事实/坑 */
+  lesson: string;
+  /** 一句话说清后续 run 应该怎么做 */
+  suggestion?: string;
+}
+
+/** 暂存区里的经验条目（带来源，便于追溯与去重清理） */
+export interface PendingLesson extends Lesson {
+  runId: string;
+  ts: string;
+}
 
 export interface ReviewFinding {
   file: string;
@@ -78,6 +100,19 @@ export interface ReviewFinding {
   must_fix: boolean;
   /** 哪个 engine 提出的这条发现（双边审查下用于区分来源） */
   reviewer?: string;
+  /**
+   * 复审轮（第 2 轮起）的发现来源，用于收敛裁决：
+   * previous = 上一轮意见未修好；delta = 修复增量引入的新问题；
+   * other = 增量之外旧代码里的新发现（第 1 轮已双边背书过的范围，默认降级 advisory 不阻塞）。
+   * 第 1 轮全量审查的发现不带此字段。
+   */
+  origin?: 'previous' | 'delta' | 'other';
+  /**
+   * origin=other 的逃生门：审查者确信旧范围新发现严重到必须现在阻塞时，
+   * 在 must_fix=true 之外还必须写明理由（第 1 轮为何没发现、为何不能后续处理）；
+   * 没有理由的 other must_fix 会被 pipeline 强制降级 advisory。
+   */
+  escape_reason?: string;
 }
 
 export interface RunRecord {
@@ -97,6 +132,14 @@ export interface RunRecord {
   reviewRound: number;
   /** 最近一轮 LLM 审查的 must_fix 发现（给 web 展示） */
   findings: ReviewFinding[];
+  /** 各轮累计的 advisory 发现（不阻塞流程，最终附在 PR 描述里）。旧 run 记录可能没有此字段。 */
+  advisories?: ReviewFinding[];
+  /** run 终态后 retro 步骤提炼的复盘经验（同时进入 knowledge 暂存区，随下一条 run 进 git） */
+  lessons?: Lesson[];
+  /** 复盘完成时间：已总结过的标记（server 启动补扫据此跳过；knowledge/summarized.ndjson 是集中台账） */
+  retroAt?: string;
+  /** 续跑次数（server 重启自动续跑 + 手动 resume 都计入；自动续跑有上限防死循环） */
+  resumes?: number;
   prUrl: string | null;
   /**
    * SDK 引擎的工作线程会话，按引擎名分桶（claude 的 session_id 和 codex 的 thread_id 不通用）。
@@ -143,7 +186,7 @@ export type RunEventType =
   | 'status' // 状态变化 {status, detail}
   | 'engine' // engine 调用 {label, state: 'start'|'end', code?}
   | 'engine-line' // engine 输出行 {line}
-  | 'review' // 一轮审查结论 {round, passed, findings}
+  | 'review' // 一轮审查结论 {round, passed, findings, advisories?, rescue?}
   | 'error'
   | 'sync'; // SSE 专用（不落盘）：历史回放完毕，此后均为实时事件
 
@@ -158,8 +201,9 @@ export const DEFAULT_CONFIG: RunConfig = {
   engine: 'claude',
   base: 'main',
   testCmd: null,
-  // 没有人工兜底了，熔断前多给几轮自动修复的机会再放弃
-  maxReviewRounds: 5,
+  // 第 1 轮全量 + 第 2 轮复审（打回方复核 + 放行方扫增量）。终局轮若只剩「旧意见未修净」
+  // 还有一次锁定范围的窄门补救（见 pipeline.rescueRound），所以 2 轮足够，不再多轮开荒。
+  maxReviewRounds: 2,
   maxCiRounds: 5,
   maxFixRounds: 5,
   reviewEngines: ['claude', 'codex'],

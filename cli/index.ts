@@ -108,7 +108,8 @@ async function attach(runId: string): Promise<RunRecord> {
 function reportResult(run: RunRecord) {
   console.log('');
   printRun(run);
-  if (run.status === 'failed') console.log(`\n→ 运行已终止，需要重新发起：ship start ...   （详情：${webUrl(run.id)}）`);
+  if (run.status === 'failed')
+    console.log(`\n→ 运行已终止。可从断点续跑：ship resume ${run.id}   （详情：${webUrl(run.id)}）`);
   else if (run.status === 'done') console.log('\n→ 已全自动完成，PR 已合并');
 }
 
@@ -227,6 +228,16 @@ prog
     const run = (await api('GET', `/api/runs/${id}`)) as RunRecord;
     if (run.status !== 'running') return reportResult(run);
     reportResult(await attach(id));
+  });
+
+prog
+  .command('resume <id>')
+  .description('续跑一个被中断/失败的运行（从持久化的阶段继续，worktree 没了会从分支重建）')
+  .option('--no-attach', '只触发不跟踪')
+  .action(async (id, o) => {
+    const run = (await api('POST', `/api/runs/${id}/resume`)) as RunRecord;
+    console.log(`⟲ 已续跑 ${run.id}（从阶段 ${run.stage} 继续）\nweb: ${webUrl(run.id)}\n`);
+    if (o.attach) reportResult(await attach(run.id));
   });
 
 // ---------- 运行组（run group） ----------

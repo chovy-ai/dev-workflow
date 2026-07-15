@@ -23,6 +23,28 @@ const dirName = (p: string) => p.replace(/\/+$/, '').split('/').pop() || p;
 
 type LogLine = { key: number; cls: string; text: string };
 
+/**
+ * 把文本里的 URL 渲染成新页面打开的链接（日志里的 PR 地址等）。
+ * split 带捕获组：奇数下标必是 URL。
+ */
+const URL_RE = /(https?:\/\/[^\s"'`<>()（）]+)/g;
+function Linkified({ text }: { text: string }) {
+  if (!text.includes('http')) return <>{text}</>;
+  return (
+    <>
+      {text.split(URL_RE).map((part, i) =>
+        i % 2 === 1 ? (
+          <a key={i} className="log-link" href={part} target="_blank" rel="noreferrer">
+            {part}
+          </a>
+        ) : (
+          part
+        ),
+      )}
+    </>
+  );
+}
+
 /** 组列表项（GET /api/groups） */
 type GroupSummary = {
   id: string;
@@ -78,25 +100,55 @@ function DiffBody({ diff }: { diff: string }) {
   );
 }
 
-/** 最近一轮 LLM 审查的 must_fix 发现 */
+/** 最近一轮 LLM 审查的 must_fix 发现 + 各轮累计的 advisory（不阻塞，附在 PR 描述） */
 function FindingsBody({ run }: { run: RunRecord }) {
-  if (run.findings?.length)
-    return (
-      <>
-        <div className="findings-note">最近一轮（第 {run.reviewRound} 轮）的 must_fix 发现：</div>
-        {run.findings.map((f, i) => (
-          <div key={i} className="finding">
-            <div className="file">{f.file}</div>
-            <div>{f.issue}</div>
-          </div>
-        ))}
-      </>
-    );
   return (
-    <div className="findings-note">
-      最近一轮 LLM 审查没有 must_fix 发现
-      {run.reviewRound ? `（共跑了 ${run.reviewRound} 轮）` : ''}。
-    </div>
+    <>
+      {run.findings?.length ? (
+        <>
+          <div className="findings-note">最近一轮（第 {run.reviewRound} 轮）的 must_fix 发现：</div>
+          {run.findings.map((f, i) => (
+            <div key={i} className="finding">
+              <div className="file">{f.file}</div>
+              <div>{f.issue}</div>
+            </div>
+          ))}
+        </>
+      ) : (
+        <div className="findings-note">
+          最近一轮 LLM 审查没有 must_fix 发现
+          {run.reviewRound ? `（共跑了 ${run.reviewRound} 轮）` : ''}。
+        </div>
+      )}
+      {!!run.advisories?.length && (
+        <>
+          <div className="findings-note">advisory（不阻塞流程，随 PR 描述附给人看）：</div>
+          {run.advisories.map((f, i) => (
+            <div key={i} className="finding advisory">
+              <div className="file">
+                {f.file}
+                {f.reviewer ? `（${f.reviewer}）` : ''}
+              </div>
+              <div>{f.issue}</div>
+            </div>
+          ))}
+        </>
+      )}
+      {!!run.lessons?.length && (
+        <>
+          <div className="findings-note">复盘经验（随该仓库下一条 run 同步进 ship.lessons.md）：</div>
+          {run.lessons.map((l, i) => (
+            <div key={i} className="finding lesson">
+              <div className="file">[{l.type}]</div>
+              <div>
+                {l.lesson}
+                {l.suggestion ? `（建议：${l.suggestion}）` : ''}
+              </div>
+            </div>
+          ))}
+        </>
+      )}
+    </>
   );
 }
 
@@ -375,7 +427,14 @@ export default function Page() {
                   {run.config.engine} · review: {run.config.reviewEngines.join('+')}
                 </div>
               </div>
-              <span className={`badge ${run.status}`}>{STATUS_LABEL[run.status] ?? run.status}</span>
+              <div className="header-actions">
+                {run.prUrl && (
+                  <a className="btn primary" href={run.prUrl} target="_blank" rel="noreferrer">
+                    打开 PR ↗
+                  </a>
+                )}
+                <span className={`badge ${run.status}`}>{STATUS_LABEL[run.status] ?? run.status}</span>
+              </div>
             </div>
 
             <div className="stepper">
@@ -392,11 +451,18 @@ export default function Page() {
             {run.status !== 'running' && (
               <div className={`banner ${run.status}`}>
                 <div className="detail-text">{run.statusDetail || STATUS_LABEL[run.status]}</div>
-                {run.status === 'done' && run.prUrl && (
+                {run.status === 'failed' && (
                   <div className="actions">
-                    <a className="btn primary" href={run.prUrl} target="_blank">
-                      查看已合并的 PR ↗
-                    </a>
+                    <button
+                      className="btn"
+                      onClick={async () => {
+                        await fetch(`/api/runs/${run.id}/resume`, { method: 'POST' });
+                        refreshRun(run.id);
+                        loadRuns();
+                      }}
+                    >
+                      ⟲ 从断点续跑
+                    </button>
                   </div>
                 )}
               </div>
@@ -415,7 +481,7 @@ export default function Page() {
                 <pre className="log">
                   {lines.map((l) => (
                     <span key={l.key} className={l.cls}>
-                      {l.text}
+                      <Linkified text={l.text} />
                       {'\n'}
                     </span>
                   ))}
