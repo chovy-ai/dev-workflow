@@ -1,16 +1,48 @@
 // engine 的单步提示词。LLM 只做单步：实现 / 修复 / 独立审查 / 解冲突；
 // 流程控制与裁决全部在 pipeline 代码里。
 
-export const implementPrompt = (p: { branch: string; base: string; plan: string; lessons?: string }) => `\
+export const implementPrompt = (p: {
+  branch: string;
+  base: string;
+  plan: string;
+  lessons?: string;
+  acceptanceMatrix?: string;
+}) => `\
 按以下已确认的方案在当前仓库实现。约束：
 - 你在分支 ${p.branch} 上，不要切换分支、不要动 ${p.base} 分支、不要 push、不要 merge。
 - 方案未覆盖的细节遵循仓库现有惯例。
 - 如果发现方案有硬伤（无法实现、前提错误），在输出中明确说明并停止，不要自作主张改方案。
 - 按逻辑单元 git commit（只提交到本地）。
-- 实现完成后，把「验证本次改动应运行的测试命令」写入 .ship/testcmd（单行 shell 命令，
-  工作目录为仓库根，能直接执行；该文件不会进提交）。后续修复轮的测试门禁会用它把关。
+- 实现完成后，把分层测试清单写入 .ship/testplan.json（JSON：fast/required/e2e 三个字符串数组，
+  命令工作目录均为仓库根；该文件不会进提交）。fast 是优先执行的秒级定向测试，required 是
+  类型检查/相关完整测试，e2e 只放方案明确要求且环境稳定的真实入口测试。harness 会在代码进入
+  reviewer 前跑完整计划，并在 review 放行后只读复验，避免产生未审的 test-fix 改动。
+- 测试必须穿过方案要求的真实生产边界；不要通过 mock 掉 adapter/provider/service 来制造伪集成覆盖。
 ${p.lessons ? `\n=== 该仓库过往运行的复盘经验（供避坑，不是本次需求）===\n${p.lessons}\n` : ''}
+${p.acceptanceMatrix ? `\n=== 实现前验收矩阵（测试不得绕过这些真实边界）===\n${p.acceptanceMatrix}\n` : ''}
 === 已确认的方案 ===
+${p.plan}
+`;
+
+export const preflightPrompt = (p: {
+  plan: string;
+  acceptanceJson: string;
+}) => `\
+你是实现前的验收设计者。阅读方案与仓库代码，输出一份能防止“测试绿但真实链路没覆盖”的验收矩阵。
+不要修改业务代码。矩阵必须写入 ${p.acceptanceJson}，JSON 格式：
+{"items":[{"acceptance":"可验证行为","production_entry":"真实生产入口/调用链",
+"do_not_mock":"不能 mock/手工注入的关键边界","test_level":"unit|integration|e2e",
+"test_command_hint":"建议命令或测试文件"}]}
+
+要求：
+- 方案每个验收标准至少对应一项；
+- 涉及 adapter/provider 字段保真时，从原始 provider 输入覆盖到最终消费；
+- 涉及共享预算/顺序时覆盖双向添加顺序；
+- 涉及编辑态时覆盖既有资源与新增资源去重；
+- 涉及安全/authority 时包含失败关闭和禁止 fallback；
+- items 不能为空，字段不能留空。只写该 JSON，不要改其它文件。
+
+=== 已确认方案 ===
 ${p.plan}
 `;
 
@@ -47,11 +79,13 @@ export const reviewPrompt = (p: {
 你是一名独立代码审查者，没有参与实现，用全新视角审查一个改动。
 待审改动 = \`git diff ${p.base}...HEAD\`（自行运行查看，可进一步阅读仓库文件求证）。
 只报告真问题，不要报风格/偏好类意见。
+\`ship.lessons.md\` 可能由 harness 在实现前自动同步；若业务实现没有在该基点之后再次改它，不属于方案越界，
+不要据此打回（pipeline 也会代码化过滤纯 harness-managed finding）。
 ${p.focus ? `\n${p.focus}\n` : ''}
 全量测试与构建由 harness 的测试门禁和 CI 负责，不要求你运行；如需求证，只运行与改动直接相关的定向测试。
 
 审查结论必须以 JSON 写入文件 ${p.reviewJson} ，格式：
-{"pass": true 或 false, "findings": [{"file": "路径", "issue": "问题描述", "must_fix": true 或 false}]}
+{"pass": true 或 false, "findings": [{"id": "稳定短 ID", "file": "路径", "issue": "问题描述", "invariant": "被破坏的不变量", "evidence": "代码证据", "reproduction": "最小复现", "required_test_boundary": "回归测试必须穿过的真实边界", "must_fix": true 或 false}]}
 判定标准：不存在 must_fix 的问题即 pass=true。除写这一个文件外，不要修改任何代码。
 ${p.lessons ? `\n=== 该仓库过往运行的高发问题（复盘累积，供重点核查，不构成结论）===\n${p.lessons}\n` : ''}
 === 方案原文 ===
@@ -72,13 +106,14 @@ export const recheckPrompt = (p: {
 ${p.focus ? `\n复审时保持你的分工侧重：\n${p.focus}\n` : ''}
 
 不要重新审查整个分支：修复增量之外的旧代码已在第 1 轮被双边全量审查背书。
+\`ship.lessons.md\` 的纯 harness 自动同步不属于业务修复增量。
 如果你在旧代码里发现了新问题，默认记为 advisory（must_fix 填 false、origin 填 "other"），不阻塞流程；
 只有你确信该问题严重到必须现在阻塞时才可以 must_fix 填 true，且必须同时给出 escape_reason
 （说明第 1 轮为何没发现、为何不能留到后续处理）——没有 escape_reason 的 other 问题会被强制降级为 advisory。
 全量测试与构建由 harness 负责，不要求你运行；如需求证，只运行与改动直接相关的定向测试。
 
 审查结论必须以 JSON 写入文件 ${p.reviewJson} ，格式：
-{"pass": true 或 false, "findings": [{"file": "路径", "issue": "问题描述", "must_fix": true 或 false, "origin": "previous" 或 "delta" 或 "other", "escape_reason": "仅 origin=other 且 must_fix=true 时必填"}]}
+{"pass": true 或 false, "findings": [{"id": "沿用旧意见 ID；新 delta 用新 ID", "file": "路径", "issue": "问题描述", "invariant": "被破坏的不变量", "evidence": "代码证据", "reproduction": "最小复现", "required_test_boundary": "回归测试必须穿过的真实边界", "must_fix": true 或 false, "origin": "previous" 或 "delta" 或 "other", "escape_reason": "仅 origin=other 且 must_fix=true 时必填"}]}
 origin 含义：previous = 上一轮意见未修好；delta = 修复增量引入的新问题；other = 增量之外旧代码里的新发现。
 判定标准：旧意见全部修好、且增量没有 must_fix 新问题，即 pass=true。除写这一个文件外，不要修改任何代码。
 
@@ -102,23 +137,35 @@ export const deltaReviewPrompt = (p: {
 ${p.focus ? `\n审查增量时保持你的分工侧重：\n${p.focus}\n` : ''}
 
 不要重新审查整个分支。如果你在增量之外的旧代码里发现新问题，默认记为 advisory
+\`ship.lessons.md\` 的纯 harness 自动同步不属于业务修复增量。
 （must_fix 填 false、origin 填 "other"），不阻塞流程；只有你确信该问题严重到必须现在阻塞时
 才可以 must_fix 填 true，且必须同时给出 escape_reason（说明第 1 轮为何没发现、为何不能留到
 后续处理）——没有 escape_reason 的 other 问题会被强制降级为 advisory。
 全量测试与构建由 harness 负责，不要求你运行；如需求证，只运行与改动直接相关的定向测试。
 
 审查结论必须以 JSON 写入文件 ${p.reviewJson} ，格式：
-{"pass": true 或 false, "findings": [{"file": "路径", "issue": "问题描述", "must_fix": true 或 false, "origin": "delta" 或 "other", "escape_reason": "仅 origin=other 且 must_fix=true 时必填"}]}
+{"pass": true 或 false, "findings": [{"id": "稳定短 ID", "file": "路径", "issue": "问题描述", "invariant": "被破坏的不变量", "evidence": "代码证据", "reproduction": "最小复现", "required_test_boundary": "回归测试必须穿过的真实边界", "must_fix": true 或 false, "origin": "delta" 或 "other", "escape_reason": "仅 origin=other 且 must_fix=true 时必填"}]}
 判定标准：增量不存在 must_fix 问题即 pass=true。除写这一个文件外，不要修改任何代码。
 
 === 方案原文 ===
 ${p.plan}
 `;
 
-export const fixPrompt = (p: { findings: string; plan: string }) => `\
+export const fixPrompt = (p: {
+  findings: string;
+  plan: string;
+  resolutionJson: string;
+}) => `\
 在当前分支逐条修复以下审查意见。要求：
 - 每条意见都要真正解决，能说清改了什么、如何验证；认为意见不成立时也要给出可查证的依据。
-- 修复后运行与改动直接相关的定向测试自证，然后按逻辑单元 git commit。
+- 若意见指出数据在 adapter/provider/service 边界丢失，回归测试必须从丢失前的真实生产入口开始，
+  禁止手工注入边界之后的对象；若意见涉及共享预算/顺序，必须覆盖两个方向；涉及编辑态时必须覆盖
+  既有资源与新增资源的去重计数。
+- 先增加能证明问题的回归测试，再修实现；修复后运行定向测试自证，然后按逻辑单元 git commit。
+- 为每条 finding 写一条结构化 resolution 到 ${p.resolutionJson}，格式：
+  {"resolutions":[{"finding_id":"原 finding id","status":"fixed|disputed","changed_files":["..."],
+  "evidence":"可查证说明","test_file":"可选测试文件","test_command":"可选但 required_test_boundary 存在时必填"}]}。
+  resolution 文件只供 harness 使用，不要提交。
 - 不要切换分支、不要 push、不要 merge、不要顺手做无关改动。
 
 === 待修复的意见 ===
@@ -126,6 +173,43 @@ ${p.findings}
 
 === 方案原文（供理解意图）===
 ${p.plan}
+`;
+
+/** 失败 run 的后继执行：继承原 feature branch，只修终局 findings，再重新走完整审查。 */
+export const successorPrompt = (p: {
+  branch: string;
+  base: string;
+  plan: string;
+  findings: string;
+  acceptanceMatrix?: string;
+}) => `\
+这是一个失败交付 run 的后继执行。当前分支 ${p.branch} 已继承上一条 run 的实现成果；不要从头重写方案。
+逐条修复下面的终局 findings，并补真实生产边界的回归测试。约束：
+- 不要切换分支、不要动 ${p.base}、不要 push、不要 merge。
+- 保留已通过复审的安全/authority 修复，不得回退。
+- 按逻辑单元提交；完成后写 .ship/testplan.json（fast/required/e2e）。
+
+=== 终局 findings ===
+${p.findings}
+
+${p.acceptanceMatrix ? `=== 实现前验收矩阵 ===\n${p.acceptanceMatrix}\n` : ''}
+=== 已确认方案 ===
+${p.plan}
+`;
+
+export const resolutionRepairPrompt = (p: {
+  resolutionJson: string;
+  errors: string;
+  findings: string;
+}) => `\
+你上一轮修复没有产出合格的结构化证据清单。不要改业务语义，只补齐缺失的回归测试/验证并重写
+${p.resolutionJson}。若 test_command 失败，先修好实现或测试并提交；不要伪造证据。
+
+=== 清单错误 ===
+${p.errors}
+
+=== 必须逐条对账的 findings ===
+${p.findings}
 `;
 
 export const testFixPrompt = (p: { testCmd: string; output: string }) => `\

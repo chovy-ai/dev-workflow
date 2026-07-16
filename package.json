@@ -8,6 +8,7 @@
     "build": "next build",
     "start": "next start -p 4870",
     "cli": "tsx cli/index.ts",
+    "test": "tsx tests/run.ts",
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {

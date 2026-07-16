@@ -7,15 +7,40 @@ import { exec, git, gh } from './exec';
 import { runSdkEngine } from './sdkEngine';
 import { runCodexSdkEngine } from './codexSdkEngine';
 import * as P from './prompts';
+import { canRunScopedRescue, chooseRescueEngine, namespaceFindingIds } from './reviewPolicy';
+import {
+  commandsForPhase,
+  mergeTestPlan,
+  readEngineTestPlan,
+  type TestGatePhase,
+} from './testPlan';
+import { readResolutionManifest, validateResolutionManifest } from './fixEvidence';
+import { readAcceptanceMatrix } from './acceptanceMatrix';
 
-/** 流水线主动停下（非异常崩溃）：没有人工兜底，一律终结为 failed，不支持 continue */
-class Halt extends Error {}
+/** 流水线主动停下（非异常崩溃），并显式声明 failed run 的合法恢复动作。 */
+class Halt extends Error {
+  constructor(
+    message: string,
+    readonly recovery: RunRecord['failureRecovery'] = 'resume',
+  ) {
+    super(message);
+  }
+}
 
 /** 单边审查经 pipeline 裁决后的结果（origin 降级已完成） */
 type EngineVerdict = { passed: boolean; mustFix: ReviewFinding[]; advisories: ReviewFinding[] };
 
 const findingsText = (findings: ReviewFinding[]) =>
-  findings.map((f) => `- [${f.file}]${f.reviewer ? ` (${f.reviewer})` : ''} ${f.issue}`).join('\n');
+  findings
+    .map(
+      (f) =>
+        `- ${f.id ? `${f.id} ` : ''}[${f.file}]${f.reviewer ? ` (${f.reviewer})` : ''} ${f.issue}` +
+        (f.invariant ? `\n  invariant: ${f.invariant}` : '') +
+        (f.evidence ? `\n  evidence: ${f.evidence}` : '') +
+        (f.reproduction ? `\n  reproduction: ${f.reproduction}` : '') +
+        (f.required_test_boundary ? `\n  required_test_boundary: ${f.required_test_boundary}` : ''),
+    )
+    .join('\n');
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
@@ -52,11 +77,17 @@ export class Pipeline {
     this.store.event(this.run, 'log', { msg });
   }
 
-  private setStatus(status: RunRecord['status'], detail = '') {
+  private setStatus(
+    status: RunRecord['status'],
+    detail = '',
+    failureRecovery?: RunRecord['failureRecovery'],
+  ) {
     this.run.status = status;
     this.run.statusDetail = detail;
+    if (status === 'failed') this.run.failureRecovery = failureRecovery ?? 'resume';
+    else delete this.run.failureRecovery;
     this.store.save(this.run);
-    this.store.event(this.run, 'status', { status, detail });
+    this.store.event(this.run, 'status', { status, detail, failureRecovery });
   }
 
   private setStage(stage: StageName) {
@@ -125,7 +156,7 @@ export class Pipeline {
       }
     } catch (e) {
       if (e instanceof Halt) {
-        this.setStatus('failed', e.message);
+        this.setStatus('failed', e.message, e.recovery);
         this.log(`✖ ${e.message}`);
       } else {
         this.setStatus('failed', String(e));
@@ -168,11 +199,16 @@ export class Pipeline {
 
   /** 基于最新 origin/base 建 git worktree（不碰原仓库的工作目录，原仓库脏不脏都无所谓） */
   private async stageWorktree() {
-    this.log(`阶段 worktree：基于最新 origin/${this.cfg.base} 建 git worktree`);
+    this.log(
+      this.run.sourceBranch
+        ? `阶段 worktree：从失败分支 ${this.run.sourceBranch} 创建后继 worktree`
+        : `阶段 worktree：基于最新 origin/${this.cfg.base} 建 git worktree`,
+    );
     await git(this.originRepo, 'fetch', 'origin');
     const name = this.branchName();
     const wtPath = path.join(this.store.runDir(this.run.id), 'worktree');
-    let r = await git(this.originRepo, 'worktree', 'add', '-b', name, wtPath, `origin/${this.cfg.base}`);
+    const startPoint = this.run.sourceBranch ?? `origin/${this.cfg.base}`;
+    let r = await git(this.originRepo, 'worktree', 'add', '-b', name, wtPath, startPoint);
     if (r.code !== 0)
       // 无远端 base（罕见）或分支名已存在时，退回：不新建分支、直接基于已有引用建 worktree
       r = await git(this.originRepo, 'worktree', 'add', wtPath, name);
@@ -181,6 +217,13 @@ export class Pipeline {
     this.run.worktreePath = wtPath;
     this.store.save(this.run);
     await this.ensureShipExcluded();
+    if (this.run.sourceBranch) {
+      const rebase = await git(wtPath, 'rebase', `origin/${this.cfg.base}`);
+      if (rebase.code !== 0) {
+        await git(wtPath, 'rebase', '--abort');
+        throw new Halt(`后继 run rebase origin/${this.cfg.base} 失败，请先处理基线冲突：${rebase.out}`);
+      }
+    }
     this.log(`✔ worktree ${wtPath}（分支 ${name}）`);
   }
 
@@ -227,18 +270,34 @@ export class Pipeline {
   }
 
   private async stageImplement() {
-    this.log('阶段 implement：engine 按方案实现，测试门禁放行');
+    this.log(
+      this.run.parentRunId
+        ? `阶段 implement：修复父 run ${this.run.parentRunId} 的终局 findings`
+        : '阶段 implement：engine 按方案实现，测试门禁放行',
+    );
     await this.assertOnFeatureBranch();
     // 先把暂存区里过往 run 的复盘经验同步进仓库（进本次 PR），再带着经验上下文开工
     await this.syncLessonsIntoRepo();
+    this.run.harnessManagedBaseSha = (await git(this.repo, 'rev-parse', 'HEAD')).out;
+    this.store.save(this.run);
+    const acceptanceMatrix = await this.buildAcceptanceMatrix();
     const preCommits = Number((await git(this.repo, 'rev-list', '--count', `${this.cfg.base}..HEAD`)).out || '0');
     await this.engineRun(
-      P.implementPrompt({
-        branch: this.run.branch!,
-        base: this.cfg.base,
-        plan: this.run.plan,
-        lessons: this.lessonsContext(),
-      }),
+      this.run.parentRunId && this.run.inheritedFindings?.length
+        ? P.successorPrompt({
+            branch: this.run.branch!,
+            base: this.cfg.base,
+            plan: this.run.plan,
+            findings: findingsText(this.run.inheritedFindings),
+            acceptanceMatrix,
+          })
+        : P.implementPrompt({
+            branch: this.run.branch!,
+            base: this.cfg.base,
+            plan: this.run.plan,
+            lessons: this.lessonsContext(),
+            acceptanceMatrix,
+          }),
       'implement',
       'implement',
     );
@@ -247,7 +306,31 @@ export class Pipeline {
     const commits = Number((await git(this.repo, 'rev-list', '--count', `${this.cfg.base}..HEAD`)).out || '0');
     if (commits <= preCommits)
       throw new Halt('implement 结束但没有产生任何提交（引擎可能失败），运行终止');
-    await this.gateTests();
+    // 首轮 review 之前先跑完整计划；任何自动 test-fix 都必须发生在审查之前。
+    await this.gateTests('all');
+  }
+
+  private async buildAcceptanceMatrix(): Promise<string> {
+    const acceptanceJson = path.join(this.shipDir, 'acceptance-matrix.json');
+    fs.mkdirSync(this.shipDir, { recursive: true });
+    fs.rmSync(acceptanceJson, { force: true });
+    const prompt = P.preflightPrompt({ plan: this.run.plan, acceptanceJson });
+    await this.engineRun(prompt, 'preflight-acceptance', 'preflight', undefined, {
+      freshSession: true,
+    });
+    if (!fs.existsSync(acceptanceJson)) {
+      this.log('⚠ preflight 未写验收矩阵，重试一次');
+      await this.engineRun(prompt, 'preflight-acceptance-retry', 'preflight', undefined, {
+        freshSession: true,
+      });
+    }
+    try {
+      const matrix = readAcceptanceMatrix(acceptanceJson);
+      this.log(`✔ 实现前验收矩阵已生成（${matrix.items.length} 项）`);
+      return JSON.stringify(matrix, null, 2);
+    } catch (error) {
+      throw new Halt(String(error));
+    }
   }
 
   private async stageAutoReview() {
@@ -266,7 +349,10 @@ export class Pipeline {
       const round = this.run.reviewRound;
       this.store.save(this.run);
       if (round > this.cfg.maxReviewRounds)
-        throw new Halt(`review 循环达到上限 ${this.cfg.maxReviewRounds} 轮仍未通过，运行终止`);
+        throw new Halt(
+          `review 循环达到上限 ${this.cfg.maxReviewRounds} 轮仍未通过，运行终止`,
+          'supersede',
+        );
       this.log(`── review 第 ${round} 轮${round > 1 ? '（复审）' : '（全量）'}`);
       // 双边并行审查，全部结果到齐后统一裁决
       const verdicts: Record<string, EngineVerdict> =
@@ -280,6 +366,8 @@ export class Pipeline {
       this.store.save(this.run);
       this.store.event(this.run, 'review', { round, passed, findings });
       if (passed) {
+        // review 放行后只能做只读验证，禁止 testFix 在审查结论之后再改业务代码。
+        await this.gateTests('all', { allowFix: false });
         this.log(`✔ 双边 review 均通过（第 ${round} 轮）`);
         return;
       }
@@ -288,15 +376,16 @@ export class Pipeline {
       if (round === this.cfg.maxReviewRounds) {
         // 终局轮的窄门补救：must_fix 全部是「旧意见未修净」时给一次锁定范围的追加修复；
         // 出现增量新问题 / 带 escape_reason 的旧范围严重问题（或第 1 轮即终局轮）则直接熔断，不变相加轮。
-        if (!findings.every((f) => f.origin === 'previous'))
-          throw new Halt(`review 终局轮（第 ${round} 轮）存在旧意见之外的 must_fix 新问题，运行终止\n${text}`);
+        if (!canRunScopedRescue(findings))
+          throw new Halt(
+            `review 终局轮（第 ${round} 轮）包含锁定范围之外的 must_fix（origin=other/未分类），运行终止\n${text}`,
+            'supersede',
+          );
         await this.rescueRound(round, verdicts);
         return;
       }
       fixBaseSha = (await git(this.repo, 'rev-parse', 'HEAD')).out;
-      await this.engineRun(P.fixPrompt({ findings: text, plan: this.run.plan }), `fix-r${round}`, 'fix');
-      await this.autoCommitIfDirty(`ship: fix review round ${round}`);
-      await this.gateTests();
+      await this.applyReviewFix(findings, `fix-r${round}`);
       prevVerdicts = verdicts;
     }
   }
@@ -370,15 +459,13 @@ export class Pipeline {
    */
   private async rescueRound(round: number, verdicts: Record<string, EngineVerdict>) {
     const unresolved = Object.values(verdicts).flatMap((v) => v.mustFix);
-    this.log(`── 终局轮补救：${unresolved.length} 条旧意见未修净，追加一次修复 + 打回方复核`);
-    const fixBaseSha = (await git(this.repo, 'rev-parse', 'HEAD')).out;
-    await this.engineRun(
-      P.fixPrompt({ findings: findingsText(unresolved), plan: this.run.plan }),
-      `fix-r${round}-rescue`,
-      'fix',
+    const rescueEngine = chooseRescueEngine(this.cfg);
+    this.log(
+      `── 终局限域救援：${unresolved.length} 条 previous/delta finding，` +
+        `改用全新 ${rescueEngine} 会话修复 + 原打回方复核`,
     );
-    await this.autoCommitIfDirty(`ship: fix review round ${round} (rescue)`);
-    await this.gateTests();
+    const fixBaseSha = (await git(this.repo, 'rev-parse', 'HEAD')).out;
+    await this.applyReviewFix(unresolved, `fix-r${round}-rescue`, rescueEngine, true);
     const rejectors = Object.entries(verdicts).filter(([, v]) => !v.passed);
     const results = await Promise.all(
       rejectors.map(async ([name, v]) => {
@@ -402,8 +489,69 @@ export class Pipeline {
     if (!passed)
       throw new Halt(
         `终局轮补救后仍有 ${findings.length} 个 must_fix 未解决，运行终止\n${findingsText(findings)}`,
+        'supersede',
       );
+    await this.gateTests('all', { allowFix: false });
     this.log('✔ 终局轮补救通过，双边 review 结清');
+  }
+
+  /**
+   * 审查修复的统一执行器：代码修改之外，强制每条 finding 产出 resolution，并由 harness
+   * 实际运行其中的 finding-specific test command。终局救援可显式换 engine + 新会话。
+   */
+  private async applyReviewFix(
+    findings: ReviewFinding[],
+    label: string,
+    engineOverride?: string,
+    freshSession = false,
+  ) {
+    const resolutionJson = path.join(this.shipDir, `resolution-${label}.json`);
+    fs.mkdirSync(this.shipDir, { recursive: true });
+    fs.rmSync(resolutionJson, { force: true });
+    await this.engineRun(
+      P.fixPrompt({
+        findings: findingsText(findings),
+        plan: this.run.plan,
+        resolutionJson,
+      }),
+      label,
+      'fix',
+      engineOverride,
+      { freshSession },
+    );
+    await this.autoCommitIfDirty(`ship: ${label}`);
+
+    let validation = this.readFixValidation(findings, resolutionJson);
+    if (validation.errors.length > 0) {
+      this.log(`⚠ 修复证据清单不完整，给 engine 一次补齐机会\n${validation.errors.join('\n')}`);
+      await this.engineRun(
+        P.resolutionRepairPrompt({
+          resolutionJson,
+          errors: validation.errors.join('\n'),
+          findings: findingsText(findings),
+        }),
+        `${label}-evidence`,
+        'fix',
+        engineOverride,
+        { freshSession: false },
+      );
+      await this.autoCommitIfDirty(`ship: ${label} evidence repair`);
+      validation = this.readFixValidation(findings, resolutionJson);
+    }
+    if (validation.errors.length > 0) {
+      throw new Halt(`修复证据门禁失败：\n${validation.errors.join('\n')}`);
+    }
+    await this.gateCommands(validation.commands, `${label} finding evidence`);
+    // 修复以及可能的 testFix 都在下一轮 reviewer 看增量之前完成。
+    await this.gateTests('all');
+  }
+
+  private readFixValidation(findings: ReviewFinding[], resolutionJson: string) {
+    try {
+      return validateResolutionManifest(findings, readResolutionManifest(resolutionJson));
+    } catch (error) {
+      return { errors: [String(error)], commands: [] as string[] };
+    }
   }
 
   /** advisory 不阻塞流程：累计到 run 记录，stagePr 时附进 PR 描述留给人看 */
@@ -436,13 +584,36 @@ export class Pipeline {
     }
     if (!fs.existsSync(reviewJson))
       throw new Halt(`${engineName} 审查者两次都未产出 review.json，运行终止`);
-    let verdict: { pass?: boolean; findings?: ReviewFinding[] };
-    try {
-      verdict = JSON.parse(fs.readFileSync(reviewJson, 'utf8'));
-    } catch (e) {
-      throw new Halt(`${engineName} 的 review.json 不是合法 JSON：${e}`);
+    let verdict = this.readReviewVerdict(engineName, reviewJson);
+    let shapeErrors = this.reviewShapeErrors(verdict.findings ?? [], recheck);
+    if (shapeErrors.length > 0) {
+      this.log(`⚠ ${engineName} 的 must-fix 缺少证据合同字段，重试一次\n${shapeErrors.join('\n')}`);
+      fs.rmSync(reviewJson, { force: true });
+      await this.engineRun(
+        `${prompt}\n\n上次输出不合格，请修正以下格式问题后重新写 JSON：\n${shapeErrors.join('\n')}`,
+        `${label}-shape-retry`,
+        'review',
+        engineName,
+      );
+      if (!fs.existsSync(reviewJson)) {
+        throw new Halt(`${engineName} 修正后仍未产出 review.json`);
+      }
+      verdict = this.readReviewVerdict(engineName, reviewJson);
+      shapeErrors = this.reviewShapeErrors(verdict.findings ?? [], recheck);
+      if (shapeErrors.length > 0) {
+        throw new Halt(`${engineName} 的审查证据合同仍不完整：\n${shapeErrors.join('\n')}`);
+      }
     }
-    const all = (verdict.findings ?? []).map((f) => ({ ...f, reviewer: engineName }));
+    const numbered = namespaceFindingIds(verdict.findings ?? [], engineName, label);
+    const all: ReviewFinding[] = [];
+    for (const finding of numbered) {
+      const enriched = { ...finding, reviewer: engineName };
+      if (await this.isHarnessManagedOnlyFinding(enriched)) {
+        this.log(`ℹ 忽略 harness-managed finding：${enriched.file}（实现阶段之后未被业务代码改动）`);
+        continue;
+      }
+      all.push(enriched);
+    }
     const demote = (f: ReviewFinding) => recheck && f.origin === 'other' && !f.escape_reason?.trim();
     const advisories = all.filter((f) => f.must_fix === false || demote(f)).map((f) => ({ ...f, must_fix: false }));
     const mustFix = all.filter((f) => f.must_fix !== false && !demote(f));
@@ -452,6 +623,58 @@ export class Pipeline {
     if (recheck && verdict.pass === false && passed)
       this.log(`⚠ ${engineName} 判 pass=false 但阻塞项均为未给出阻塞理由的旧范围新发现（已降级 advisory），按通过处理`);
     return { passed, mustFix, advisories };
+  }
+
+  private readReviewVerdict(
+    engineName: string,
+    reviewJson: string,
+  ): { pass?: boolean; findings?: ReviewFinding[] } {
+    try {
+      return JSON.parse(fs.readFileSync(reviewJson, 'utf8'));
+    } catch (error) {
+      throw new Halt(`${engineName} 的 review.json 不是合法 JSON：${error}`);
+    }
+  }
+
+  private reviewShapeErrors(findings: ReviewFinding[], recheck: boolean): string[] {
+    const errors: string[] = [];
+    const seenIds = new Set<string>();
+    findings.forEach((finding, index) => {
+      if (finding.must_fix === false) return;
+      const label = finding.id?.trim() || `finding#${index + 1}`;
+      for (const key of [
+        'file',
+        'issue',
+        'invariant',
+        'evidence',
+        'reproduction',
+        'required_test_boundary',
+      ] as const) {
+        if (typeof finding[key] !== 'string' || !finding[key]?.trim()) {
+          errors.push(`${label} 缺少 ${key}`);
+        }
+      }
+      if (recheck && !finding.id?.trim()) errors.push(`${label} 缺少稳定 id`);
+      if (finding.id?.trim()) {
+        if (seenIds.has(finding.id.trim())) errors.push(`${label} 的 id 重复`);
+        seenIds.add(finding.id.trim());
+      }
+      if (recheck && !finding.origin) errors.push(`${label} 缺少 origin`);
+    });
+    return errors;
+  }
+
+  private async isHarnessManagedOnlyFinding(finding: ReviewFinding): Promise<boolean> {
+    if (finding.file !== 'ship.lessons.md' || !this.run.harnessManagedBaseSha) return false;
+    const diff = await git(
+      this.repo,
+      'diff',
+      '--quiet',
+      `${this.run.harnessManagedBaseSha}...HEAD`,
+      '--',
+      finding.file,
+    );
+    return diff.code === 0;
   }
 
   private async stagePr() {
@@ -537,7 +760,7 @@ export class Pipeline {
         throw new Halt(`CI 修复达到上限 ${this.cfg.maxCiRounds} 轮仍未绿，运行终止`);
       this.log(`✖ CI 失败（第 ${fixRound} 轮），交给 engine 修复`);
       await this.engineRun(P.ciFixPrompt({ checks: checks.out.slice(-6000) }), `ci-fix-${fixRound}`, 'ciFix');
-      await this.gateTests();
+      await this.gateTests('required');
       await this.autoCommitIfDirty(`ship: fix CI (round ${fixRound})`);
       let r = await git(this.repo, 'push', 'origin', this.run.branch!);
       if (r.code !== 0) {
@@ -583,7 +806,7 @@ export class Pipeline {
         throw new Halt('engine 未能完成冲突解决，已 rebase --abort 恢复现场，运行终止');
       }
     }
-    await this.gateTests();
+    await this.gateTests('required');
     const push = await git(this.repo, 'push', '--force-with-lease', 'origin', this.run.branch!);
     if (push.code !== 0) throw new Halt(`冲突解决后 push 失败：${push.out}`);
     this.log('✔ 冲突已解决并推送');
@@ -775,9 +998,9 @@ export class Pipeline {
 
   // ---------------------------------------------------------- gates & engine
 
-  private async detectTestCmd(): Promise<string | null> {
+  private async detectFallbackTestCmd(): Promise<string | null> {
     if (this.cfg.testCmd) return this.cfg.testCmd;
-    // implement 阶段 engine 按 implementPrompt 约定落的定向测试命令（monorepo 等自动探测不到的场景）
+    // 旧 run / 旧 engine 的兼容入口；新实现应写 .ship/testplan.json。
     const tcFile = path.join(this.shipDir, 'testcmd');
     if (fs.existsSync(tcFile)) {
       const cmd = fs
@@ -803,28 +1026,64 @@ export class Pipeline {
     return null;
   }
 
-  /** 代码门禁：测试不绿不放行；失败交 engine 修，封顶 maxFixRounds */
-  private async gateTests() {
-    const cmd = await this.detectTestCmd();
-    if (!cmd) {
-      this.log('⚠ 未探测到测试命令（可在配置里指定 testCmd），跳过测试门禁');
+  private async resolvedTestPlan() {
+    let enginePlan;
+    try {
+      enginePlan = readEngineTestPlan(path.join(this.shipDir, 'testplan.json'));
+    } catch (error) {
+      throw new Halt(String(error));
+    }
+    return mergeTestPlan({
+      configured: this.cfg.testPlan,
+      engine: enginePlan,
+      legacyOrDetected: await this.detectFallbackTestCmd(),
+    });
+  }
+
+  /** 分层代码门禁；review 放行后的最终验证通过 allowFix=false 保证不会再产生未审改动。 */
+  private async gateTests(
+    phase: TestGatePhase,
+    opts: { allowFix?: boolean } = {},
+  ) {
+    const commands = commandsForPhase(await this.resolvedTestPlan(), phase);
+    if (commands.length === 0) {
+      this.log(`⚠ ${phase} 测试计划为空，跳过该层门禁`);
       return;
     }
-    for (let attempt = 0; attempt <= this.cfg.maxFixRounds; attempt++) {
-      const r = await exec(cmd, this.repo);
-      if (r.code === 0) {
-        this.log(`✔ 测试通过（${cmd}）`);
-        return;
+    await this.gateCommands(commands, `${phase} test plan`, opts);
+  }
+
+  private async gateCommands(
+    commands: string[],
+    label: string,
+    opts: { allowFix?: boolean } = {},
+  ) {
+    const allowFix = opts.allowFix ?? true;
+    for (const cmd of [...new Set(commands)]) {
+      for (let attempt = 0; attempt <= this.cfg.maxFixRounds; attempt++) {
+        const r = await exec(cmd, this.repo);
+        if (r.code === 0) {
+          this.log(`✔ 测试通过（${label}：${cmd}）`);
+          break;
+        }
+        if (!allowFix) {
+          throw new Halt(
+            `审查放行后的只读测试失败（${label}：${cmd}）；禁止在 review 之后自动改代码。最后输出：\n${r.out.slice(-3000)}`,
+          );
+        }
+        if (attempt === this.cfg.maxFixRounds) {
+          throw new Halt(
+            `测试修复 ${attempt} 轮后仍失败（${label}：${cmd}）。最后输出：\n${r.out.slice(-3000)}`,
+          );
+        }
+        this.log(`✖ 测试失败（${label}：${cmd}，第 ${attempt + 1} 次），交给 engine 修复`);
+        await this.engineRun(
+          P.testFixPrompt({ testCmd: cmd, output: r.out.slice(-6000) }),
+          `test-fix-${attempt + 1}`,
+          'testFix',
+        );
+        await this.autoCommitIfDirty(`ship: fix failing tests (${label}, attempt ${attempt + 1})`);
       }
-      if (attempt === this.cfg.maxFixRounds)
-        throw new Halt(`测试修复 ${attempt} 轮后仍失败，运行终止。最后输出：\n${r.out.slice(-3000)}`);
-      this.log(`✖ 测试失败（第 ${attempt + 1} 次），交给 engine 修复`);
-      await this.engineRun(
-        P.testFixPrompt({ testCmd: cmd, output: r.out.slice(-6000) }),
-        `test-fix-${attempt + 1}`,
-        'testFix',
-      );
-      await this.autoCommitIfDirty(`ship: fix failing tests (attempt ${attempt + 1})`);
     }
   }
 
@@ -864,7 +1123,7 @@ export class Pipeline {
     label: string,
     kind: StepKind,
     engineOverride?: string,
-    opts?: { cwd?: string },
+    opts?: { cwd?: string; freshSession?: boolean },
   ): Promise<number> {
     const engineName = engineOverride ?? this.cfg.stageEngines?.[kind] ?? this.cfg.engine;
     const spec = this.cfg.engines[engineName];
@@ -885,7 +1144,10 @@ export class Pipeline {
       // review 必须全新会话——独立审查的价值就在于没有实现过程的上下文。
       // 会话按引擎名分桶：claude 的 session_id 和 codex 的 thread_id 不通用。
       this.run.sdkSessions ??= {};
-      const resume = kind === 'review' ? null : (this.run.sdkSessions[engineName] ?? null);
+      const resume =
+        kind === 'review' || opts?.freshSession
+          ? null
+          : (this.run.sdkSessions[engineName] ?? null);
       const onLine = (line: string) => {
         fs.appendFileSync(logFile, line + '\n');
         this.store.event(this.run, 'engine-line', { label, line });
@@ -901,7 +1163,7 @@ export class Pipeline {
               onLine,
               additionalDirectories: await this.codexExtraWritableDirs(cwd),
             });
-      if (kind !== 'review' && res.sessionId) {
+      if (kind !== 'review' && kind !== 'preflight' && res.sessionId) {
         this.run.sdkSessions[engineName] = res.sessionId;
         this.store.save(this.run);
       }

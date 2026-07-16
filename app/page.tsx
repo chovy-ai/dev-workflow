@@ -2,6 +2,7 @@
 
 import { useCallback, useEffect, useRef, useState } from 'react';
 import type { GroupRecord, RunEvent, RunRecord } from '@/lib/types';
+import { recoveryForRun } from '@/lib/recoveryPolicy';
 
 const STAGES = ['worktree', 'implement', 'autoReview', 'pr', 'ci', 'done'] as const;
 const STAGE_LABEL: Record<string, string> = {
@@ -286,6 +287,7 @@ export default function Page() {
   }, [lines, tab]);
 
   const stageIdx = run ? STAGES.indexOf(run.stage) : -1;
+  const failedRecovery = run?.status === 'failed' ? recoveryForRun(run) : null;
 
   return (
     <div className="app">
@@ -453,16 +455,39 @@ export default function Page() {
                 <div className="detail-text">{run.statusDetail || STATUS_LABEL[run.status]}</div>
                 {run.status === 'failed' && (
                   <div className="actions">
-                    <button
-                      className="btn"
-                      onClick={async () => {
-                        await fetch(`/api/runs/${run.id}/resume`, { method: 'POST' });
-                        refreshRun(run.id);
-                        loadRuns();
-                      }}
-                    >
-                      ⟲ 从断点续跑
-                    </button>
+                    {failedRecovery === 'supersede' ? (
+                      <button
+                        className="btn"
+                        onClick={async () => {
+                          const res = await fetch(`/api/runs/${run.id}/supersede`, { method: 'POST' });
+                          const data = await res.json();
+                          if (!res.ok) {
+                            window.alert(data.error ?? '创建后继执行失败');
+                            return;
+                          }
+                          await loadRuns();
+                          location.hash = `#/run/${data.id}`;
+                        }}
+                      >
+                        ↪ 保留成果创建后继执行
+                      </button>
+                    ) : (
+                      <button
+                        className="btn"
+                        onClick={async () => {
+                          const res = await fetch(`/api/runs/${run.id}/resume`, { method: 'POST' });
+                          if (!res.ok) {
+                            const data = await res.json();
+                            window.alert(data.error ?? '断点续跑失败');
+                            return;
+                          }
+                          refreshRun(run.id);
+                          loadRuns();
+                        }}
+                      >
+                        ⟲ 从断点续跑
+                      </button>
+                    )}
                   </div>
                 )}
               </div>
