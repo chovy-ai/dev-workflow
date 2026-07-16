@@ -4,7 +4,7 @@ import { getStore, createRun } from '@/lib/runtime';
 export const dynamic = 'force-dynamic';
 
 /** 默认过滤掉已归档 run（按 run 自身 archivedAt）；?archived=1 只返回已归档项 */
-export async function GET(req: NextRequest) {
+export async function GET(req: Request) {
   const archived = new URL(req.url).searchParams.get('archived') === '1';
   const runs = getStore()
     .list()

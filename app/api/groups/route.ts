@@ -1,4 +1,4 @@
-import { NextRequest, NextResponse } from 'next/server';
+import { NextResponse } from 'next/server';
 import { getStore, createGroup } from '@/lib/runtime';
 import { deriveGroupStatus } from '@/lib/types';
 
@@ -9,7 +9,7 @@ export const dynamic = 'force-dynamic';
  * 默认过滤掉已归档组（按组自身 archivedAt，与成员各自的 archivedAt 独立）；?archived=1 只返回已归档组。
  * 成员摘要带 updatedAt，供侧边栏推导组的最大 updatedAt 用于排序。
  */
-export async function GET(req: NextRequest) {
+export async function GET(req: Request) {
   const archived = new URL(req.url).searchParams.get('archived') === '1';
   const store = getStore();
   const groups = store
@@ -37,7 +37,7 @@ export async function GET(req: NextRequest) {
  * plan 是方案文本（CLI 负责读文件，server 不解析相对路径）。
  * 任一仓库校验不通过 → 4xx 并指明是哪个仓库、什么原因，一个 run 都不创建。
  */
-export async function POST(req: NextRequest) {
+export async function POST(req: Request) {
   const body = await req.json().catch(() => ({}));
   if (!body.title || !Array.isArray(body.repos) || body.repos.length === 0)
     return NextResponse.json({ error: '需要 title 和非空 repos' }, { status: 400 });

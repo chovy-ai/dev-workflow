@@ -40,6 +40,23 @@ const STATUS_ICON: Record<string, string> = {
   running: '▶', failed: '✖', done: '✔',
 };
 
+/** 裸 GET（不因 4xx 退出，用于探测资源是否存在）；网络不通才退出提示启动 server */
+async function rawGet(p: string): Promise<Response> {
+  try {
+    return await fetch(`${SERVER}${p}`);
+  } catch {
+    console.error(`✖ 连不上 server（${SERVER}）。先启动：ship serve`);
+    process.exit(3);
+  }
+}
+
+/** 查真实 server 判定 id 是 run 还是组（先查 run 再查 group）；都 404 返回 null */
+async function detectKind(id: string): Promise<'run' | 'group' | null> {
+  if ((await rawGet(`/api/runs/${id}`)).ok) return 'run';
+  if ((await rawGet(`/api/groups/${id}`)).ok) return 'group';
+  return null;
+}
+
 function printRun(r: RunRecord) {
   console.log(
     `${STATUS_ICON[r.status] ?? '?'} ${r.id}  [${r.stage}/${r.status}]  ${r.title}` +
@@ -210,11 +227,48 @@ async function startGroup(manifestArg: string, engineFlag?: string) {
   console.log('\n→ 各仓库独立全自动推进，打开 web 看进度；或 ship groups 查看');
 }
 
-prog.command('ls').description('列出所有运行').action(async () => {
-  const runs = (await api('GET', '/api/runs')) as RunRecord[];
-  if (!runs.length) console.log('（还没有运行）');
-  for (const r of runs) printRun(r);
-});
+prog
+  .command('ls')
+  .description('列出运行（默认不含已归档）')
+  .option('--archived', '只列出已归档的运行')
+  .action(async (o) => {
+    const runs = (await api('GET', `/api/runs${o.archived ? '?archived=1' : ''}`)) as RunRecord[];
+    if (!runs.length) return console.log(o.archived ? '（没有已归档运行）' : '（还没有运行）');
+    for (const r of runs) printRun(r);
+  });
+
+prog
+  .command('archive [id]')
+  .description('归档 run 或组（自动识别 id）；--done 一键归档全部已完成')
+  .option('--done', '归档全部已完成的散 run 与全 done 的组（等价 archive-done）')
+  .option('--restore', '还原（取消归档）而非归档')
+  .action(async (id, o) => {
+    if (o.done) {
+      const { runs, groups } = (await api('POST', '/api/runs/archive-done')) as {
+        runs: number;
+        groups: number;
+      };
+      return console.log(`✔ 已归档 ${runs} 个散 run、${groups} 个组`);
+    }
+    if (!id) {
+      console.error('✖ 需要 <id>（run 或组）或 --done');
+      process.exit(1);
+    }
+    const archived = !o.restore;
+    const verb = archived ? '已归档' : '已还原';
+    // 自动识别 id 属于 run 还是组：查真实 server（先 run 后 group）
+    const kind = await detectKind(id);
+    if (kind === 'run') {
+      await api('POST', `/api/runs/${id}/archive`, { archived });
+      console.log(`✔ ${verb} run ${id}`);
+    } else if (kind === 'group') {
+      await api('POST', `/api/groups/${id}/archive`, { archived });
+      console.log(`✔ ${verb} 组 ${id}`);
+    } else {
+      console.error(`✖ 未找到 run 或组：${id}`);
+      process.exit(1);
+    }
+  });
 
 prog
   .command('status <id>')
@@ -244,10 +298,15 @@ prog
 
 prog
   .command('groups')
-  .description('列出所有运行组（状态 + 成员概览）')
-  .action(async () => {
-    const groups = (await api('GET', '/api/groups')) as GroupSummary[];
-    if (!groups.length) return console.log('（还没有运行组）');
+  .description('列出运行组（状态 + 成员概览，默认不含已归档）')
+  .option('--archived', '只列出已归档的运行组')
+  .action(async (o) => {
+    const groups = (await api(
+      'GET',
+      `/api/groups${o.archived ? '?archived=1' : ''}`,
+    )) as GroupSummary[];
+    if (!groups.length)
+      return console.log(o.archived ? '（没有已归档运行组）' : '（还没有运行组）');
     for (const g of groups) {
       console.log(`${STATUS_ICON[g.status] ?? '?'} ${g.id}  [${g.status}]  ${g.title}`);
       for (const r of g.runs)
