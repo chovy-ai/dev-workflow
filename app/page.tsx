@@ -2,6 +2,13 @@
 
 import { useCallback, useEffect, useRef, useState } from 'react';
 import type { GroupRecord, RunEvent, RunRecord } from '@/lib/types';
+import {
+  partition,
+  archivedItems,
+  relativeTime,
+  type GroupSummary,
+  type SidebarItem,
+} from '@/lib/sidebar';
 
 const STAGES = ['worktree', 'implement', 'autoReview', 'pr', 'ci', 'done'] as const;
 const STAGE_LABEL: Record<string, string> = {
@@ -45,15 +52,6 @@ function Linkified({ text }: { text: string }) {
   );
 }
 
-/** 组列表项（GET /api/groups） */
-type GroupSummary = {
-  id: string;
-  title: string;
-  runIds: string[];
-  createdAt: string;
-  status: string;
-  runs: { id: string; repoPath: string; stage: string; status: string }[];
-};
 /** 组详情（GET /api/groups/:id） */
 type GroupDetail = { group: GroupRecord; status: string; runs: RunRecord[] };
 
@@ -155,6 +153,11 @@ function FindingsBody({ run }: { run: RunRecord }) {
 export default function Page() {
   const [runs, setRuns] = useState<RunRecord[]>([]);
   const [groups, setGroups] = useState<GroupSummary[]>([]);
+  // 已归档分区：默认折叠，展开后才懒加载 ?archived=1
+  const [archivedRuns, setArchivedRuns] = useState<RunRecord[]>([]);
+  const [archivedGroups, setArchivedGroups] = useState<GroupSummary[]>([]);
+  const [archivedOpen, setArchivedOpen] = useState(false);
+  const [now, setNow] = useState(() => Date.now());
   const [run, setRun] = useState<RunRecord | null>(null);
   const [group, setGroup] = useState<GroupDetail | null>(null);
   const [lines, setLines] = useState<LogLine[]>([]);
@@ -166,8 +169,9 @@ export default function Page() {
   const runIdRef = useRef<string | null>(null);
   const groupIdRef = useRef<string | null>(null);
 
-  // 侧边栏数据：runs + groups 一起刷新
+  // 侧边栏活跃数据：未归档 runs + groups 一起刷新（不含已归档，已归档单独懒加载）
   const loadRuns = useCallback(async () => {
+    setNow(Date.now());
     const [rs, gs] = await Promise.all([
       fetch('/api/runs').then((r) => r.json()).catch(() => []),
       fetch('/api/groups').then((r) => r.json()).catch(() => []),
@@ -175,6 +179,47 @@ export default function Page() {
     setRuns(rs);
     setGroups(gs);
   }, []);
+
+  // 已归档数据：仅在展开时请求（懒加载）
+  const loadArchived = useCallback(async () => {
+    const [rs, gs] = await Promise.all([
+      fetch('/api/runs?archived=1').then((r) => r.json()).catch(() => []),
+      fetch('/api/groups?archived=1').then((r) => r.json()).catch(() => []),
+    ]);
+    setArchivedRuns(rs);
+    setArchivedGroups(gs);
+  }, []);
+
+  // 归档 / 还原 run 或 group，然后刷新活跃 + 已归档（若展开）
+  const doArchive = useCallback(
+    async (kind: 'run' | 'group', id: string, archived: boolean) => {
+      const url = kind === 'run' ? `/api/runs/${id}/archive` : `/api/groups/${id}/archive`;
+      await fetch(url, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ archived }),
+      });
+      await loadRuns();
+      if (archivedOpen) await loadArchived();
+    },
+    [loadRuns, loadArchived, archivedOpen],
+  );
+
+  // 「全部归档」：一键归档所有已完成，然后刷新
+  const archiveAllDone = useCallback(async () => {
+    await fetch('/api/runs/archive-done', { method: 'POST' });
+    await loadRuns();
+    if (archivedOpen) await loadArchived();
+  }, [loadRuns, loadArchived, archivedOpen]);
+
+  // 展开/折叠已归档分区；展开的那一刻才发 ?archived=1 请求
+  const toggleArchived = useCallback(() => {
+    setArchivedOpen((open) => {
+      const next = !open;
+      if (next) loadArchived();
+      return next;
+    });
+  }, [loadArchived]);
 
   const refreshRun = useCallback(async (id: string) => {
     const res = await fetch(`/api/runs/${id}`);
@@ -287,6 +332,78 @@ export default function Page() {
 
   const stageIdx = run ? STAGES.indexOf(run.stage) : -1;
 
+  // 四分区：活跃三区从未归档数据推导，已归档区来自懒加载的 ?archived=1 数据
+  const parts = partition(runs, groups);
+  const archived = archivedItems(archivedRuns, archivedGroups);
+  const listEmpty = runs.length === 0 && groups.length === 0;
+
+  // 渲染一个侧边栏条目（散 run 或组）。inArchived=true 时归档按钮变「还原」。
+  const renderItem = (item: SidebarItem, inArchived: boolean) => {
+    const canArchive = !inArchived && item.status !== 'running'; // running 不可归档
+    const actionBtn = (kind: 'run' | 'group', id: string) =>
+      (canArchive || inArchived) && (
+        <button
+          className="si-arch"
+          onClick={(e) => {
+            e.stopPropagation();
+            doArchive(kind, id, !inArchived);
+          }}
+        >
+          {inArchived ? '还原' : '归档'}
+        </button>
+      );
+
+    if (item.kind === 'group') {
+      const g = item.group;
+      return (
+        <div key={g.id} className={`side-item group${group?.group.id === g.id ? ' active' : ''}`}>
+          <div className="si-row" onClick={() => (location.hash = `#/group/${g.id}`)}>
+            <div className="si-head">
+              <span className="si-title">🧩 {g.title}</span>
+              <span className={`badge ${g.status}`}>{GROUP_STATUS_LABEL[g.status] ?? g.status}</span>
+            </div>
+            <div className="si-meta">
+              <span className="repo-tag">{g.runIds.length} 仓库</span>
+              <span className="si-time">{relativeTime(item.updatedAt, now)}</span>
+              {actionBtn('group', g.id)}
+            </div>
+          </div>
+          <div className="group-members">
+            {g.runs.map((r) => (
+              <div
+                key={r.id}
+                className={`group-member${run?.id === r.id ? ' active' : ''}`}
+                onClick={() => (location.hash = `#/run/${r.id}`)}
+              >
+                <span className="mname">{dirName(r.repoPath)}</span>
+                <span className={`badge ${r.status}`}>{STATUS_LABEL[r.status] ?? r.status}</span>
+              </div>
+            ))}
+          </div>
+        </div>
+      );
+    }
+
+    const r = item.run;
+    return (
+      <div
+        key={r.id}
+        className={`side-item run${run?.id === r.id ? ' active' : ''}`}
+        onClick={() => (location.hash = `#/run/${r.id}`)}
+      >
+        <div className="si-head">
+          <span className="si-title">{r.title}</span>
+          <span className={`badge ${r.status}`}>{STATUS_LABEL[r.status] ?? r.status}</span>
+        </div>
+        <div className="si-meta">
+          <span className="repo-tag">{dirName(r.repoPath)}</span>
+          <span className="si-time">{relativeTime(item.updatedAt, now)}</span>
+          {actionBtn('run', r.id)}
+        </div>
+      </div>
+    );
+  };
+
   return (
     <div className="app">
       <aside className="sidebar">
@@ -295,7 +412,7 @@ export default function Page() {
           <span className="sub">方案 → 自动合并 PR · 全自动 · 本地</span>
         </header>
         <div className="run-list">
-          {runs.length === 0 && groups.length === 0 && (
+          {listEmpty && (
             <div className="empty-list">
               还没有运行。在仓库里执行：
               <br />
@@ -307,46 +424,55 @@ export default function Page() {
             </div>
           )}
 
-          {/* 组块：带 groupId 的 run 归入组显示 */}
-          {groups.map((g) => (
-            <div key={g.id} className={`group-block${group?.group.id === g.id ? ' active' : ''}`}>
-              <div className="group-head" onClick={() => (location.hash = `#/group/${g.id}`)}>
-                <span className="name">🧩 {g.title}</span>
-                <span className={`badge ${g.status}`}>{GROUP_STATUS_LABEL[g.status] ?? g.status}</span>
+          {/* 进行中 */}
+          {parts.running.length > 0 && (
+            <div className="side-section">
+              <div className="side-section-head">
+                <span>进行中</span>
+                <span className="cnt">{parts.running.length}</span>
               </div>
-              <div className="group-members">
-                {g.runs.map((r) => (
-                  <div
-                    key={r.id}
-                    className={`group-member${run?.id === r.id ? ' active' : ''}`}
-                    onClick={() => (location.hash = `#/run/${r.id}`)}
-                  >
-                    <span className="mname">{dirName(r.repoPath)}</span>
-                    <span className={`badge ${r.status}`}>{STATUS_LABEL[r.status] ?? r.status}</span>
-                  </div>
-                ))}
-              </div>
+              {parts.running.map((it) => renderItem(it, false))}
             </div>
-          ))}
+          )}
 
-          {/* 无组的 run 照旧平铺 */}
-          {runs
-            .filter((r) => !r.groupId)
-            .map((r) => (
-              <div
-                key={r.id}
-                className={`run-item${run?.id === r.id ? ' active' : ''}`}
-                onClick={() => (location.hash = `#/run/${r.id}`)}
-              >
-                <div className="t">
-                  <span className="name">{r.title}</span>
-                  <span className={`badge ${r.status}`}>{STATUS_LABEL[r.status] ?? r.status}</span>
-                </div>
-                <div className="meta">
-                  {r.id} · {r.branch ?? ''}
-                </div>
+          {/* 需要处理（failed，红色强调——唯一需要人介入） */}
+          {parts.needAttention.length > 0 && (
+            <div className="side-section attention">
+              <div className="side-section-head">
+                <span>需要处理</span>
+                <span className="cnt">{parts.needAttention.length}</span>
               </div>
-            ))}
+              {parts.needAttention.map((it) => renderItem(it, false))}
+            </div>
+          )}
+
+          {/* 已完成（分区头带「全部归档」） */}
+          {parts.done.length > 0 && (
+            <div className="side-section">
+              <div className="side-section-head">
+                <span>已完成</span>
+                <button className="head-btn" onClick={archiveAllDone} title="归档全部已完成">
+                  全部归档
+                </button>
+              </div>
+              {parts.done.map((it) => renderItem(it, false))}
+            </div>
+          )}
+
+          {/* 已归档（默认折叠；展开时才请求 ?archived=1 懒加载） */}
+          <div className="side-section archived">
+            <div className="side-section-head clickable" onClick={toggleArchived}>
+              <span>
+                {archivedOpen ? '▾' : '▸'} 已归档
+              </span>
+            </div>
+            {archivedOpen &&
+              (archived.length > 0 ? (
+                archived.map((it) => renderItem(it, true))
+              ) : (
+                <div className="side-empty-hint">（暂无已归档）</div>
+              ))}
+          </div>
         </div>
       </aside>
 
