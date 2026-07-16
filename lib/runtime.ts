@@ -13,7 +13,13 @@ import { defaultCheckCmd, resolveDeps, validateGroupDeps } from './deps';
  * Next.js 开发模式会按需重编译模块；用 globalThis 缓存保证
  * Store（含事件总线）与推进锁在整个 node 进程内是同一份。
  */
-type G = typeof globalThis & { __shipStore?: Store; __shipAdvancing?: Set<string>; __shipBooted?: boolean };
+type G = typeof globalThis & {
+  __shipStore?: Store;
+  __shipAdvancing?: Set<string>;
+  __shipBooted?: boolean;
+  __shipStartedAt?: string;
+  __shipMeta?: ServerMeta;
+};
 const g = globalThis as G;
 
 /** server 重启后自动续跑的次数上限：防止"续跑→再崩→再续跑"死循环 */
@@ -25,10 +31,37 @@ export function getStore(): Store {
   if (!g.__shipStore) g.__shipStore = new Store();
   if (!g.__shipBooted) {
     g.__shipBooted = true;
+    g.__shipStartedAt = new Date().toISOString();
     const store = g.__shipStore;
+    registerShutdownMarker(store);
     setTimeout(() => bootRecover(store), 0);
   }
   return g.__shipStore;
+}
+
+/**
+ * server 停止（Ctrl+C / kill）时给本进程内正在推进的 run 落一条中断说明——
+ * 下次任何人打开看板或 `ship ls` 都能一眼看出「这是 server 停止造成的中断」而不是流水线故障。
+ * 只写同步落盘的 statusDetail，不改 status（保持 running 才能被 bootRecover 续跑）。
+ * 不抢占 next 自己的信号处理：仅当没有其它监听者时才自行退出。
+ */
+function registerShutdownMarker(store: Store) {
+  const mark = () => {
+    for (const id of advancing()) {
+      const run = store.get(id);
+      if (!run || run.status !== 'running') continue;
+      run.statusDetail =
+        `server 停止时中断于阶段 ${run.stage}。重启 server 会自动续跑（SHIP_NO_AUTO_RESUME=1 可禁用）；` +
+        `也可 ship resume/cancel 手动处置`;
+      store.save(run);
+    }
+  };
+  for (const sig of ['SIGINT', 'SIGTERM'] as const)
+    process.once(sig, () => {
+      mark();
+      if (process.listenerCount(sig) === 0) process.exit(sig === 'SIGINT' ? 130 : 143);
+    });
+  process.once('beforeExit', mark);
 }
 
 /**
@@ -38,9 +71,18 @@ export function getStore(): Store {
  * 2) 复盘补扫：已终态但没总结过（无 retroAt）的 run 补跑 retro，保证"每条 run 都被总结过一次"。
  */
 function bootRecover(store: Store) {
+  // 护栏：SHIP_NO_AUTO_RESUME=1 时只报告不续跑——人工接管/排查现场时避免 server 一启动
+  // 就把孤儿 run 自动拉起烧 engine（今天的真实事故形态：接管后的分支被二次交付）
+  const noAuto = process.env.SHIP_NO_AUTO_RESUME === '1';
   for (const id of store.interruptedAtLoad) {
     const run = store.get(id);
     if (!run || run.status !== 'running' || isAdvancing(id)) continue;
+    if (noAuto) {
+      store.event(run, 'log', {
+        msg: '⟲ server 重启：检测到中断的 run（SHIP_NO_AUTO_RESUME=1，未自动续跑；可 ship resume / cancel）',
+      });
+      continue;
+    }
     const resumes = (run.resumes ?? 0) + 1;
     if (resumes > MAX_AUTO_RESUMES) {
       run.status = 'failed';
@@ -248,6 +290,57 @@ export function resumeRun(id: string): { run?: RunRecord; error?: string; status
   store.event(run, 'log', { msg: `⟲ 手动续跑（从阶段 ${run.stage} 继续）` });
   advance(run);
   return { run, status: 200 };
+}
+
+/**
+ * 取消一个孤儿 running run——server 停止/重启遗留的「status=running 但本进程并未推进」的记录。
+ * 正在本进程内推进的 run 不可取消（409）：流水线没有安全暂停点，要终止请先停 server 再取消。
+ * 取消后转 failed（终态），随时可 resume / supersede 恢复。
+ */
+export function cancelRun(id: string): { run?: RunRecord; error?: string; status: number } {
+  const store = getStore();
+  const run = store.get(id);
+  if (!run) return { error: `run 不存在：${id}`, status: 404 };
+  if (run.status !== 'running')
+    return { error: `run 已是终态（${run.status}），无需取消`, status: 400 };
+  if (isAdvancing(id))
+    return {
+      error: '该 run 正在本 server 进程内推进，不能取消（流水线没有暂停点）；要终止请先停 server 再取消',
+      status: 409,
+    };
+  run.status = 'failed';
+  run.statusDetail = '人工取消（server 中断遗留的 running 记录）；如需继续可 resume / supersede';
+  store.save(run);
+  store.event(run, 'status', { status: run.status, detail: run.statusDetail });
+  return { run, status: 200 };
+}
+
+/** server 自述元信息：CLI 用 codeSha 对比磁盘 HEAD，提示「server 跑的是旧代码」 */
+export interface ServerMeta {
+  pid: number;
+  startedAt: string;
+  /** server 进程工作目录（代码目录）当前的 git HEAD；非 git 目录为 null */
+  codeSha: string | null;
+  /** 代码目录有未提交改动（dev 模式热重载会吃到，但 sha 对不上提交历史） */
+  dirty: boolean;
+}
+
+export async function getMeta(): Promise<ServerMeta> {
+  getStore();
+  // 正常 boot 在 getStore 里记 startedAt；测试脚手架直接注入 store 时这里兜底
+  g.__shipStartedAt ??= new Date().toISOString();
+  if (!g.__shipMeta) {
+    const root = process.cwd();
+    const sha = await git(root, 'rev-parse', 'HEAD');
+    const status = await git(root, 'status', '--porcelain');
+    g.__shipMeta = {
+      pid: process.pid,
+      startedAt: g.__shipStartedAt!,
+      codeSha: sha.code === 0 ? sha.out : null,
+      dirty: status.code === 0 && status.out.length > 0,
+    };
+  }
+  return g.__shipMeta;
 }
 
 export async function createRun(input: {

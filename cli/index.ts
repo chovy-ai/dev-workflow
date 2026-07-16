@@ -3,8 +3,9 @@ import { Command } from 'commander';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { spawn } from 'node:child_process';
+import { execSync, spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
+import { ATTACH_GIVE_UP_MS, nextBackoffMs, shouldGiveUp } from '../lib/attachPolicy';
 import {
   DEFAULT_PORT,
   type GroupRecord,
@@ -58,6 +59,29 @@ async function detectKind(id: string): Promise<'run' | 'group' | null> {
   return null;
 }
 
+/**
+ * server 新旧代码检查（不阻塞）：server 启动后 harness 代码又有新提交时，
+ * 流水线仍按旧代码跑——今天的真实事故形态。探测失败/非 git 一律静默跳过。
+ */
+async function warnStaleServer() {
+  try {
+    const res = await fetch(`${SERVER}/api/meta`);
+    if (!res.ok) return;
+    const meta = (await res.json()) as { codeSha: string | null; startedAt: string };
+    if (!meta.codeSha) return;
+    const head = execSync('git rev-parse HEAD', { cwd: PKG_ROOT, stdio: ['ignore', 'pipe', 'ignore'] })
+      .toString()
+      .trim();
+    if (head !== meta.codeSha)
+      console.error(
+        `⚠ server 跑的代码（${meta.codeSha.slice(0, 7)}，启动于 ${meta.startedAt}）` +
+          `≠ harness 磁盘 HEAD（${head.slice(0, 7)}）。流水线按 server 侧代码执行；要用新代码请重启：ship serve`,
+      );
+  } catch {
+    /* 元信息拿不到不影响主流程 */
+  }
+}
+
 function printRun(r: RunRecord) {
   console.log(
     `${STATUS_ICON[r.status] ?? '?'} ${r.id}  [${r.stage}/${r.status}]  ${r.title}` +
@@ -85,9 +109,26 @@ type GroupSummary = GroupRecord & {
   runs: { id: string; repoPath: string; stage: string; status: string }[];
 };
 
-/** 通过 SSE 实时跟踪一个 run，直到进入暂停/终态 */
-async function attach(runId: string): Promise<RunRecord> {
-  const res = await fetch(`${SERVER}/api/runs/${runId}/events?after=0`);
+/** 裸取 run（不 exit，供 attach 重连期间探测用）；server 不可达返回 null */
+async function tryGetRun(runId: string): Promise<RunRecord | null> {
+  try {
+    const res = await fetch(`${SERVER}/api/runs/${runId}`);
+    return res.ok ? ((await res.json()) as RunRecord) : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * 单次 SSE 连接：从 afterSeq 之后续读（重连时不重复打印）。
+ * 返回终态 run；流被对端关闭但 run 未终态时返回 null（交给外层重连）；网络错抛异常。
+ */
+async function attachOnce(
+  runId: string,
+  afterSeq: number,
+  onSeq: (seq: number) => void,
+): Promise<RunRecord | null> {
+  const res = await fetch(`${SERVER}/api/runs/${runId}/events?after=${afterSeq}`);
   if (!res.ok || !res.body) throw new Error(`事件流打开失败：${res.status}`);
   const reader = res.body.getReader();
   const decoder = new TextDecoder();
@@ -103,24 +144,66 @@ async function attach(runId: string): Promise<RunRecord> {
       const data = frame.split('\n').find((l) => l.startsWith('data: '))?.slice(6);
       if (!data) continue;
       const ev = JSON.parse(data) as RunEvent;
+      if (ev.seq > 0) onSeq(ev.seq);
       const d = ev.data as any;
       if (ev.type === 'log') console.log(`  ${d.msg}`);
       else if (ev.type === 'stage') console.log(`\n== 阶段 ${d.stage} ==`);
       else if (ev.type === 'engine-line') console.log(`    │ ${d.line}`);
       else if (ev.type === 'sync') {
         synced = true;
-        const run = (await api('GET', `/api/runs/${runId}`)) as RunRecord;
-        if (run.status !== 'running') {
+        const run = await tryGetRun(runId);
+        if (run && run.status !== 'running') {
           reader.cancel().catch(() => {});
           return run;
         }
       } else if (ev.type === 'status' && synced && d.status !== 'running') {
         reader.cancel().catch(() => {});
-        return (await api('GET', `/api/runs/${runId}`)) as RunRecord;
+        const run = await tryGetRun(runId);
+        if (run) return run;
+        throw new Error('server 在终态确认时不可达');
       }
     }
   }
-  return (await api('GET', `/api/runs/${runId}`)) as RunRecord;
+  return null;
+}
+
+/**
+ * 通过 SSE 实时跟踪一个 run 直到终态。对 server 重启/断连有韧性：
+ * 断开先用 REST 探一次终态（断连窗口内可能已跑完），否则指数退避重连并按 seq 续读；
+ * 持续不可达超过 ATTACH_GIVE_UP_MS 才放弃（run 在 server 侧不受影响）。
+ */
+async function attach(runId: string): Promise<RunRecord> {
+  let lastSeq = 0;
+  let attempt = 0;
+  let failedSince: number | null = null;
+  while (true) {
+    try {
+      const final = await attachOnce(runId, lastSeq, (seq) => (lastSeq = seq));
+      if (final) return final;
+    } catch {
+      /* 网络错/流打开失败 → 下方统一走探测+退避 */
+    }
+    const run = await tryGetRun(runId);
+    if (run && run.status !== 'running') return run;
+    if (run) {
+      // server 活着只是流断了：重置退避（最坏 1s 轮询）
+      failedSince = null;
+      attempt = 0;
+    } else {
+      if (failedSince === null) {
+        failedSince = Date.now();
+        console.error('⟲ 事件流断开且 server 不可达，退避重连中…');
+      }
+      if (shouldGiveUp(failedSince, Date.now())) {
+        console.error(
+          `✖ server 持续不可达（已重试 ${Math.round(ATTACH_GIVE_UP_MS / 60_000)} 分钟），停止跟踪。` +
+            `run 在 server 侧的推进不受影响，恢复后看板确认：${webUrl(runId)}`,
+        );
+        process.exit(3);
+      }
+    }
+    await new Promise((r) => setTimeout(r, nextBackoffMs(attempt++)));
+  }
 }
 
 function reportResult(run: RunRecord) {
@@ -157,6 +240,7 @@ prog
   .option('--engine <name>', '实现/修复步骤用的 engine（如 claude / codex，默认 claude；双边审查不受影响。--group 时作为各仓库的默认值，可被清单里的 engine 覆盖）')
   .option('--no-attach', '只创建不跟踪（单仓）')
   .action(async (o) => {
+    await warnStaleServer();
     if (o.group) return startGroup(o.group, o.engine);
     if (!o.plan) {
       console.error('✖ 需要 --plan <file> 或 --group <manifest.json>');
@@ -297,10 +381,21 @@ prog
 
 prog
   .command('attach <id>')
-  .description('实时跟踪运行输出')
+  .description('实时跟踪运行输出（对 server 重启/断连自动退避重连）')
   .action(async (id) => {
-    const run = (await api('GET', `/api/runs/${id}`)) as RunRecord;
-    if (run.status !== 'running') return reportResult(run);
+    // server 暂不可达不直接退出——attach 的价值就在于扛住 server 重启窗口；404 仍即时报错
+    let run: RunRecord | null = null;
+    try {
+      const res = await fetch(`${SERVER}/api/runs/${id}`);
+      if (res.status === 404) {
+        console.error(`✖ run 不存在：${id}`);
+        process.exit(1);
+      }
+      if (res.ok) run = (await res.json()) as RunRecord;
+    } catch {
+      console.error('⟲ server 暂不可达，等待重连…');
+    }
+    if (run && run.status !== 'running') return reportResult(run);
     reportResult(await attach(id));
   });
 
@@ -309,9 +404,18 @@ prog
   .description('续跑一个被中断/失败的运行（从持久化的阶段继续，worktree 没了会从分支重建）')
   .option('--no-attach', '只触发不跟踪')
   .action(async (id, o) => {
+    await warnStaleServer();
     const run = (await api('POST', `/api/runs/${id}/resume`)) as RunRecord;
     console.log(`⟲ 已续跑 ${run.id}（从阶段 ${run.stage} 继续）\nweb: ${webUrl(run.id)}\n`);
     if (o.attach) reportResult(await attach(run.id));
+  });
+
+prog
+  .command('cancel <id>')
+  .description('取消孤儿 running run（server 中断遗留的记录）；正在推进的 run 需先停 server')
+  .action(async (id) => {
+    const run = (await api('POST', `/api/runs/${id}/cancel`)) as RunRecord;
+    console.log(`✔ 已取消 ${run.id}（转 failed；如需继续可 ship resume / supersede）`);
   });
 
 prog

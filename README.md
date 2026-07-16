@@ -96,6 +96,10 @@ ship start --plan plan.md --engine codex   # 实现/修复用 codex（默认 cla
 ship ls                            # 运行列表（默认不含已归档；--archived 只看已归档）
 ship groups                        # 运行组列表（同样支持 --archived）
 ship attach <id>                   # 阻塞到该运行到达终态（done/failed）才返回，期间打印实时输出
+                                   #（对 server 重启有韧性：断开自动退避重连、按事件 seq 续读不重复打印；
+                                   #  持续不可达 5 分钟才放弃，run 在 server 侧不受影响）
+ship cancel <id>                   # 取消孤儿 running run（server 中断遗留的记录，转 failed 可再 resume/supersede）；
+                                   # 正在推进中的 run 会被拒绝（先停 server 再取消）
 ship resume <id>                   # 中断/失败的运行从持久化的阶段继续（自动重建 worktree；已归档会自动取消归档）
 ship supersede <failed-id>         # 审查熔断：继承失败分支与 findings，创建新预算的后继 run
 ship archive <run-id|group-id>     # 归档 run 或组（自动识别 id；running 不可归档）；--restore 还原
@@ -105,6 +109,12 @@ ship archive --done                # 一键归档全部已完成（done 散 run 
 > 归档是纯展示/管理层概念，不影响执行与断点续跑。web 侧边栏按「进行中 / 需要处理 / 已完成 / 已归档」
 > 四分区展示，区内按最近活动（updatedAt）倒序；「已完成」分区头一键「全部归档」，「已归档」默认折叠、
 > 展开才懒加载。
+
+**server 停机与孤儿 run**：server 停止（Ctrl+C/kill）时会给正在推进的 run 写入中断说明
+（状态保持 running）；重启后 `bootRecover` 自动续跑（上限 3 次），设 `SHIP_NO_AUTO_RESUME=1`
+可改为只报告不续跑（人工接管/排查现场时避免误烧 engine），此时用 `ship resume` / `ship cancel`
+逐个处置。`GET /api/meta` 暴露 server 的 pid/启动时间/代码 HEAD，CLI 在 start/resume 前会比对
+harness 磁盘 HEAD，不一致时提示「server 跑的是旧代码，重启生效」。
 
 `ship attach <id>` 阻塞到终态才退出这个特性，是给 agent 编排用的原语：agent 触发 `ship start
 --no-attach` 后，把 `ship attach <id>` 丢进自己所在环境的后台执行能力里（不同步等待），run 跑完时

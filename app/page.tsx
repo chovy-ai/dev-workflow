@@ -631,6 +631,25 @@ export default function Page() {
                 </div>
               </div>
               <div className="header-actions">
+                {/* 疑似孤儿（running 但 90s 无任何活动）才给取消入口；真在推进的 run server 会 409 */}
+                {run.status === 'running' && Date.parse(run.updatedAt) < now - 90_000 && (
+                  <button
+                    className="btn danger"
+                    title="server 中断遗留的 running 记录可取消；正在推进的 run 会被拒绝"
+                    onClick={async () => {
+                      const res = await fetch(`/api/runs/${run.id}/cancel`, { method: 'POST' });
+                      if (!res.ok) {
+                        const d = await res.json();
+                        window.alert(d.error ?? '取消失败');
+                        return;
+                      }
+                      refreshRun(run.id);
+                      loadRuns();
+                    }}
+                  >
+                    ✋ 取消（疑似中断）
+                  </button>
+                )}
                 {run.prUrl && (
                   <a className="btn primary" href={run.prUrl} target="_blank" rel="noreferrer">
                     打开 PR ↗
