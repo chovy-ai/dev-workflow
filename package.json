@@ -13,6 +13,7 @@
   "dependencies": {
     "@anthropic-ai/claude-agent-sdk": "^0.3.201",
     "@openai/codex-sdk": "^0.144.4",
+    "@xyflow/react": "^12.11.2",
     "commander": "^12.1.0",
     "next": "^15.1.0",
     "react": "^19.0.0",

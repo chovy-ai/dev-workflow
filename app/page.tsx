@@ -1,6 +1,6 @@
 'use client';
 
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import type { GroupRecord, RunEvent, RunRecord } from '@/lib/types';
 import {
   partition,
@@ -10,10 +10,13 @@ import {
   type GroupSummary,
   type SidebarItem,
 } from '@/lib/sidebar';
+import { deriveGraph, type GraphNode } from '@/lib/progressGraph';
+import ProgressFlow from './ProgressFlow';
+import GroupFlow from './GroupFlow';
 
-const STAGES = ['worktree', 'implement', 'autoReview', 'pr', 'ci', 'done'] as const;
+const STAGES = ['worktree', 'implement', 'awaitDeps', 'autoReview', 'pr', 'ci', 'done'] as const;
 const STAGE_LABEL: Record<string, string> = {
-  worktree: '建 Worktree', implement: '实现', autoReview: '双边审查',
+  worktree: '建 Worktree', implement: '实现', awaitDeps: '等待上游', autoReview: '双边审查',
   pr: '提 PR', ci: 'CI/冲突', done: '完成',
 };
 // run 与 group 状态共用一套标签（组状态是 running/failed/done 的子集）
@@ -55,6 +58,20 @@ function Linkified({ text }: { text: string }) {
 
 /** 组详情（GET /api/groups/:id） */
 type GroupDetail = { group: GroupRecord; status: string; runs: RunRecord[] };
+
+/** 组成员的迷你进度条：主干阶段推进比例，颜色随状态（与进度图同一状态色系） */
+function MiniProgress({ stage, status }: { stage: string; status: string }) {
+  const idx = Math.max(0, (STAGES as readonly string[]).indexOf(stage));
+  const pct = status === 'done' ? 100 : Math.round((idx / (STAGES.length - 1)) * 100);
+  return (
+    <div className="mini-progress">
+      <div className="mini-progress-track">
+        <div className={`mini-progress-fill ${status}`} style={{ width: `${pct}%` }} />
+      </div>
+      <span className="mini-progress-label">{STAGE_LABEL[stage] ?? stage}</span>
+    </div>
+  );
+}
 
 function formatEvent(ev: RunEvent): LogLine | null {
   const ts = ev.ts.slice(11, 19);
@@ -162,9 +179,13 @@ export default function Page() {
   const [run, setRun] = useState<RunRecord | null>(null);
   const [group, setGroup] = useState<GroupDetail | null>(null);
   const [lines, setLines] = useState<LogLine[]>([]);
+  // 原始事件流（进度图推导 + 节点抽屉按 label 过滤 engine-line 用）
+  const [events, setEvents] = useState<RunEvent[]>([]);
+  // 进度图中当前选中的节点 id（右侧抽屉）
+  const [selNode, setSelNode] = useState<string | null>(null);
   const [diff, setDiff] = useState('');
   const [groupDiffs, setGroupDiffs] = useState<Record<string, string>>({});
-  const [tab, setTab] = useState<'log' | 'diff' | 'findings' | 'plan'>('log');
+  const [tab, setTab] = useState<'progress' | 'log' | 'diff' | 'findings' | 'plan'>('progress');
   const [groupTab, setGroupTab] = useState<'diff' | 'findings' | 'plan'>('diff');
   const logRef = useRef<HTMLDivElement>(null);
   const runIdRef = useRef<string | null>(null);
@@ -262,12 +283,18 @@ export default function Page() {
     (id: string) => {
       runIdRef.current = id;
       setLines([]);
+      setEvents([]);
+      setSelNode(null);
+      setTab('progress');
       setDiff('');
       refreshRun(id);
       loadDiff(id);
       const es = new EventSource(`/api/runs/${id}/events?after=0`);
       es.onmessage = (m) => {
         const ev = JSON.parse(m.data) as RunEvent;
+        // 原始事件（跳过 sync 标记，按 seq 去重）供进度图与抽屉使用
+        if (ev.seq > 0)
+          setEvents((prev) => (prev.some((e) => e.seq === ev.seq) ? prev : [...prev, ev]));
         const line = formatEvent(ev);
         if (line) setLines((prev) => (prev.some((l) => l.key === line.key) ? prev : [...prev, line]));
         if (ev.type === 'status' || ev.type === 'stage' || ev.type === 'review') {
@@ -341,7 +368,22 @@ export default function Page() {
     if (el) el.scrollTop = el.scrollHeight;
   }, [lines, tab]);
 
-  const stageIdx = run ? STAGES.indexOf(run.stage) : -1;
+  // 进度图：纯函数推导（事件流 + run 快照），随 SSE 事件自动更新
+  const graph = useMemo(() => (run ? deriveGraph(run, events) : null), [run, events]);
+  const drawerNode: GraphNode | null = graph?.nodes.find((n) => n.id === selNode) ?? null;
+  // 抽屉内容：该节点关联 label 的 engine 输出尾部（最后 40 行）
+  const drawerLines = useMemo(() => {
+    if (!drawerNode) return [];
+    return events
+      .filter((e) => e.type === 'engine-line' && drawerNode.labels.includes(String((e.data as any).label)))
+      .slice(-40);
+  }, [events, drawerNode]);
+  // 常驻信息条：最近一条 error 事件（进行中也可见，不用等终态 banner）
+  const lastError = useMemo(() => {
+    for (let i = events.length - 1; i >= 0; i--)
+      if (events[i].type === 'error') return String((events[i].data as any).error ?? '');
+    return null;
+  }, [events]);
 
   // 四分区：活跃三区从未归档数据推导，已归档区来自懒加载的 ?archived=1 数据。
   // 把活跃条目 id 传给 archivedItems 做结构性互斥：即便已归档缓存短暂陈旧（如 resume
@@ -505,11 +547,15 @@ export default function Page() {
               </span>
             </div>
 
+            {/* 泳道 DAG：每仓库一条泳道，依赖边从上游「完成」连到下游「等待上游」 */}
+            <GroupFlow runs={group.runs} />
+
             <table className="group-table">
               <thead>
                 <tr>
                   <th>仓库</th>
                   <th>分支</th>
+                  <th>依赖</th>
                   <th>阶段</th>
                   <th>状态</th>
                 </tr>
@@ -519,7 +565,19 @@ export default function Page() {
                   <tr key={r.id} onClick={() => (location.hash = `#/run/${r.id}`)}>
                     <td>{dirName(r.repoPath)}</td>
                     <td className="mono">{r.branch ?? '(未建)'}</td>
-                    <td>{STAGE_LABEL[r.stage] ?? r.stage}</td>
+                    <td className="mono">
+                      {r.dependsOn?.length
+                        ? r.dependsOn
+                            .map((id) => {
+                              const up = group.runs.find((x) => x.id === id);
+                              return up ? dirName(up.repoPath) : id;
+                            })
+                            .join('、')
+                        : '—'}
+                    </td>
+                    <td>
+                      <MiniProgress stage={r.stage} status={r.status} />
+                    </td>
                     <td>
                       <span className={`badge ${r.status}`}>{STATUS_LABEL[r.status] ?? r.status}</span>
                     </td>
@@ -563,8 +621,9 @@ export default function Page() {
                 )}
                 <h2>{run.title}</h2>
                 <div className="meta">
+                  {/* 旧 run 记录可能没有 reviewEngines 字段，防御式渲染 */}
                   {run.repoPath} · {run.branch ?? '(worktree 未建)'} → {run.config.base} · engine:{' '}
-                  {run.config.engine} · review: {run.config.reviewEngines.join('+')}
+                  {run.config.engine} · review: {(run.config.reviewEngines ?? []).join('+') || '—'}
                 </div>
               </div>
               <div className="header-actions">
@@ -578,8 +637,10 @@ export default function Page() {
             </div>
 
             <div className="stepper">
-              {STAGES.map((s, i) => {
-                const cls = run.status === 'done' || i < stageIdx ? 'done' : i === stageIdx ? 'current' : '';
+              {/* 无依赖的 run 不显示 awaitDeps 阶段 */}
+              {STAGES.filter((s) => s !== 'awaitDeps' || run.dependsOn?.length).map((s, i, arr) => {
+                const cur = arr.indexOf(run.stage as (typeof arr)[number]);
+                const cls = run.status === 'done' || i < cur ? 'done' : i === cur ? 'current' : '';
                 return (
                   <div key={s} className={`step ${cls}`}>
                     {cls === 'done' ? '✓' : cls === 'current' ? '●' : '○'} {STAGE_LABEL[s]}
@@ -605,14 +666,59 @@ export default function Page() {
             )}
 
             <nav className="tabs">
-              {(['log', 'diff', 'findings', 'plan'] as const).map((t) => (
+              {(['progress', 'log', 'diff', 'findings', 'plan'] as const).map((t) => (
                 <button key={t} className={tab === t ? 'active' : ''} onClick={() => { setTab(t); if (t === 'diff' && run) loadDiff(run.id); }}>
-                  {{ log: '日志', diff: 'Diff', findings: '审查发现', plan: '方案' }[t]}
+                  {{ progress: '进度', log: '日志', diff: 'Diff', findings: '审查发现', plan: '方案' }[t]}
                 </button>
               ))}
             </nav>
 
             <div className="tab-body" ref={tab === 'log' ? logRef : undefined}>
+              {tab === 'progress' && graph && (
+                <div className="progress-view">
+                  {/* 常驻信息条：当前阶段 + 失败原因/最近错误（核心信息，不必翻日志） */}
+                  {(lastError || (run.status === 'failed' && run.statusDetail)) && (
+                    <div className="pg-strip bad">
+                      ✖ {run.status === 'failed' && run.statusDetail ? run.statusDetail : lastError}
+                    </div>
+                  )}
+                  <div className="pg-layout">
+                    <ProgressFlow nodes={graph.nodes} edges={graph.edges} onSelect={setSelNode} />
+                    {drawerNode && (
+                      <aside className="pg-drawer">
+                        <div className="pg-drawer-head">
+                          <span className="pg-drawer-title">
+                            {drawerNode.title}
+                            {drawerNode.sub ? ` · ${drawerNode.sub}` : ''}
+                          </span>
+                          <button className="pg-drawer-close" onClick={() => setSelNode(null)}>
+                            ✕
+                          </button>
+                        </div>
+                        <div className="pg-drawer-meta">
+                          状态：{{ pending: '未到达', active: '进行中', ok: '通过', bad: '失败/打回' }[drawerNode.status]}
+                          {drawerNode.kind === 'review' && drawerNode.round ? ` · 第 ${drawerNode.round} 轮` : ''}
+                          {drawerNode.kind === 'loop' && drawerNode.round ? ` · 已执行 ${drawerNode.round} 次` : ''}
+                          {drawerNode.findings ? ` · ${drawerNode.findings} 个 must_fix` : ''}
+                        </div>
+                        {drawerNode.error && <div className="pg-drawer-error">✖ {drawerNode.error}</div>}
+                        {drawerLines.length > 0 ? (
+                          <pre className="pg-drawer-log">
+                            {drawerLines.map((e) => (
+                              <span key={e.seq}>
+                                <Linkified text={String((e.data as any).line)} />
+                                {'\n'}
+                              </span>
+                            ))}
+                          </pre>
+                        ) : (
+                          <div className="pg-drawer-empty">（该步骤暂无 engine 输出）</div>
+                        )}
+                      </aside>
+                    )}
+                  </div>
+                </div>
+              )}
               {tab === 'log' && (
                 <pre className="log">
                   {lines.map((l) => (

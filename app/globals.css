@@ -164,3 +164,49 @@ a { color: inherit; text-decoration: none; }
 .finding.lesson { border-left-color: var(--accent); }
 .finding.lesson .file { color: var(--accent); }
 .findings-note { color: var(--fg-dim); margin-bottom: 12px; }
+
+/* ---------- progress graph（进度图 + 节点抽屉） ---------- */
+.progress-view { display: flex; flex-direction: column; height: 100%; min-height: 420px; }
+.pg-strip { padding: 8px 14px; border-radius: 8px; margin-bottom: 10px; font-size: 13px; white-space: pre-wrap; }
+.pg-strip.bad { background: #33190f; border: 1px solid #6b3a18; color: #f0a29a; }
+.pg-layout { display: flex; flex: 1; min-height: 400px; gap: 12px; }
+.pg-canvas { flex: 1; min-width: 0; border: 1px solid var(--border); border-radius: 8px; background: var(--bg2); }
+.pg-canvas .react-flow { background: transparent; }
+.pg-canvas .react-flow__edge-path { stroke: var(--fg-dim); }
+.pg-canvas .react-flow__edge.animated .react-flow__edge-path { stroke: var(--accent); }
+
+.pg-node { min-width: 128px; max-width: 180px; padding: 8px 12px; border-radius: 8px; background: var(--bg3); border: 1px solid var(--border); color: var(--fg-dim); font-size: 12px; cursor: pointer; }
+.pg-node .pg-title { font-weight: 700; color: inherit; }
+.pg-node .pg-sub { font-size: 11px; opacity: 0.75; margin-top: 2px; }
+.pg-node .pg-badges { display: flex; gap: 4px; flex-wrap: wrap; margin-top: 4px; }
+.pg-badge { font-size: 10.5px; padding: 1px 6px; border-radius: 8px; background: var(--bg2); border: 1px solid var(--border); color: var(--fg-dim); }
+.pg-badge.bad { color: #f0a29a; border-color: #6b3a18; }
+.pg-badge.dim { opacity: 0.7; }
+.pg-node.ok { color: var(--green); border-color: #234630; }
+.pg-node.bad { color: #f0958a; border-color: var(--red); background: #33190f; }
+.pg-node.active { color: #fff; background: #21324e; border-color: var(--accent); animation: pg-breath 1.6s ease-in-out infinite; }
+.pg-node.pending { opacity: 0.55; }
+@keyframes pg-breath { 0%, 100% { box-shadow: 0 0 0 0 rgba(90, 150, 255, 0.35); } 50% { box-shadow: 0 0 0 6px rgba(90, 150, 255, 0); } }
+
+.pg-drawer { width: 340px; flex-shrink: 0; border: 1px solid var(--border); border-radius: 8px; background: var(--bg2); display: flex; flex-direction: column; overflow: hidden; }
+.pg-drawer-head { display: flex; justify-content: space-between; align-items: center; padding: 10px 14px; border-bottom: 1px solid var(--border); }
+.pg-drawer-title { font-weight: 700; font-size: 13px; }
+.pg-drawer-close { background: none; border: none; color: var(--fg-dim); cursor: pointer; font-size: 13px; }
+.pg-drawer-close:hover { color: var(--fg); }
+.pg-drawer-meta { padding: 8px 14px; color: var(--fg-dim); font-size: 12px; border-bottom: 1px solid var(--border); }
+.pg-drawer-error { padding: 8px 14px; color: #f0a29a; font-size: 12px; white-space: pre-wrap; border-bottom: 1px solid var(--border); }
+.pg-drawer-log { flex: 1; overflow: auto; padding: 10px 14px; font-size: 11.5px; color: var(--fg-dim); white-space: pre-wrap; margin: 0; }
+.pg-drawer-empty { padding: 14px; color: var(--fg-dim); font-size: 12px; }
+
+/* ---------- group 成员迷你进度条 ---------- */
+.mini-progress { display: flex; align-items: center; gap: 8px; min-width: 140px; }
+.mini-progress-track { flex: 1; height: 6px; border-radius: 3px; background: var(--bg3); border: 1px solid var(--border); overflow: hidden; }
+.mini-progress-fill { height: 100%; border-radius: 3px; background: var(--accent); transition: width 0.4s; }
+.mini-progress-fill.done { background: var(--green); }
+.mini-progress-fill.failed { background: var(--red); }
+.mini-progress-label { font-size: 11.5px; color: var(--fg-dim); white-space: nowrap; }
+
+/* ---------- group 泳道 DAG ---------- */
+.gf-canvas { border: 1px solid var(--border); border-radius: 8px; background: var(--bg2); margin: 16px 0 4px; }
+.gf-lane-label { font-family: var(--mono); color: var(--amber); font-weight: 700; font-size: 13px; }
+.pg-handle { opacity: 0; width: 1px; height: 1px; min-width: 0; min-height: 0; border: none; background: transparent; pointer-events: none; }
