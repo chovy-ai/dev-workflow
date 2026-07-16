@@ -1,17 +1,23 @@
 'use client';
 
-// 进度图渲染（React Flow 只读画布）：布局手算固定坐标——流水线形状固定
+// 进度图渲染（React Flow 画布）：布局手算固定坐标——流水线形状固定
 // （主干横排、审查引擎纵排、循环步骤挂下方、回边虚线），不引布局库。
+// 节点支持手动拖拽（数据刷新时保留拖过的位置），右上角「一键布局」恢复自动布局。
 // 数据一律来自 lib/progressGraph 的纯函数推导，本文件只管摆放与样式。
-import { useMemo } from 'react';
+import { useEffect, useMemo, useRef } from 'react';
 import {
   Background,
   Handle,
+  Panel,
   Position,
   ReactFlow,
+  ReactFlowProvider,
+  useNodesState,
+  useReactFlow,
   type Edge,
   type Node,
   type NodeProps,
+  type XYPosition,
 } from '@xyflow/react';
 import '@xyflow/react/dist/style.css';
 import type { GraphEdge, GraphNode, NodeStatus } from '@/lib/progressGraph';
@@ -92,11 +98,34 @@ export function layout(nodes: GraphNode[], opts?: { idPrefix?: string; yOffset?:
       type: 'step',
       position: { x, y: y + dy },
       data: { node: n },
-      draggable: false,
       connectable: false,
       selectable: true,
     };
   });
+}
+
+/**
+ * 可拖拽画布的公共钩子逻辑：数据推导出的自动布局 + 手动拖拽覆盖位置表。
+ * 数据刷新（SSE/轮询）重建节点时保留拖过的位置；relayout() 清空覆盖并恢复自动布局。
+ */
+export function useDraggableLayout(derived: Node[]) {
+  const [flowNodes, setFlowNodes, onNodesChange] = useNodesState<Node>([]);
+  const overrides = useRef<Record<string, XYPosition>>({});
+  const { fitView } = useReactFlow();
+  useEffect(() => {
+    setFlowNodes(
+      derived.map((n) => (overrides.current[n.id] ? { ...n, position: overrides.current[n.id] } : n)),
+    );
+  }, [derived, setFlowNodes]);
+  const onNodeDragStop = (_: unknown, node: Node) => {
+    overrides.current[node.id] = node.position;
+  };
+  const relayout = () => {
+    overrides.current = {};
+    setFlowNodes(derived);
+    requestAnimationFrame(() => fitView({ duration: 300 }));
+  };
+  return { flowNodes, onNodesChange, onNodeDragStop, relayout };
 }
 
 export function toFlowEdges(edges: GraphEdge[], nodes: GraphNode[], idPrefix = ''): Edge[] {
@@ -111,38 +140,52 @@ export function toFlowEdges(edges: GraphEdge[], nodes: GraphNode[], idPrefix = '
   }));
 }
 
-export default function ProgressFlow({
-  nodes,
-  edges,
-  onSelect,
-}: {
+type ProgressFlowProps = {
   nodes: GraphNode[];
   edges: GraphEdge[];
   onSelect: (id: string | null) => void;
-}) {
-  const flowNodes = useMemo(() => layout(nodes), [nodes]);
+};
+
+function ProgressFlowInner({ nodes, edges, onSelect }: ProgressFlowProps) {
+  const derived = useMemo(() => layout(nodes), [nodes]);
   const flowEdges = useMemo(() => toFlowEdges(edges, nodes), [edges, nodes]);
+  const { flowNodes, onNodesChange, onNodeDragStop, relayout } = useDraggableLayout(derived);
+  return (
+    <ReactFlow
+      nodes={flowNodes}
+      edges={flowEdges}
+      onNodesChange={onNodesChange}
+      onNodeDragStop={onNodeDragStop}
+      nodeTypes={nodeTypes}
+      fitView
+      minZoom={0.3}
+      maxZoom={1.5}
+      nodesDraggable
+      nodesConnectable={false}
+      edgesFocusable={false}
+      panOnScroll
+      zoomOnScroll={false}
+      zoomOnPinch
+      proOptions={{ hideAttribution: true }}
+      onNodeClick={(_, node) => onSelect(node.id)}
+      onPaneClick={() => onSelect(null)}
+    >
+      <Background gap={18} size={1} />
+      <Panel position="top-right">
+        <button className="pg-relayout" title="恢复自动布局并适配视野" onClick={relayout}>
+          ⊞ 一键布局
+        </button>
+      </Panel>
+    </ReactFlow>
+  );
+}
+
+export default function ProgressFlow(props: ProgressFlowProps) {
   return (
     <div className="pg-canvas">
-      <ReactFlow
-        nodes={flowNodes}
-        edges={flowEdges}
-        nodeTypes={nodeTypes}
-        fitView
-        minZoom={0.3}
-        maxZoom={1.5}
-        nodesDraggable={false}
-        nodesConnectable={false}
-        edgesFocusable={false}
-        panOnScroll
-        zoomOnScroll={false}
-        zoomOnPinch
-        proOptions={{ hideAttribution: true }}
-        onNodeClick={(_, node) => onSelect(node.id)}
-        onPaneClick={() => onSelect(null)}
-      >
-        <Background gap={18} size={1} />
-      </ReactFlow>
+      <ReactFlowProvider>
+        <ProgressFlowInner {...props} />
+      </ReactFlowProvider>
     </div>
   );
 }
