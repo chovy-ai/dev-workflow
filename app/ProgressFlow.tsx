@@ -134,6 +134,9 @@ export default function ProgressFlow({
         nodesDraggable={false}
         nodesConnectable={false}
         edgesFocusable={false}
+        panOnScroll
+        zoomOnScroll={false}
+        zoomOnPinch
         proOptions={{ hideAttribution: true }}
         onNodeClick={(_, node) => onSelect(node.id)}
         onPaneClick={() => onSelect(null)}

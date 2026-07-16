@@ -69,6 +69,9 @@ export default function GroupFlow({ runs }: { runs: RunRecord[] }) {
         nodesDraggable={false}
         nodesConnectable={false}
         edgesFocusable={false}
+        panOnScroll
+        zoomOnScroll={false}
+        zoomOnPinch
         proOptions={{ hideAttribution: true }}
         onNodeClick={(_, node) => {
           const runId = String(node.id).split(':')[0];
