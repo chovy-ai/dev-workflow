@@ -70,8 +70,9 @@ export interface RunConfig {
    */
   stageEngines?: Partial<Record<StepKind, string>>;
   /**
-   * autoReview 阶段双边独立审查的引擎名列表，默认 ['claude', 'codex']——两边跨厂商各自独立审查，
-   * 都通过（pass=true 且无 must_fix）才算这一轮过；任一方打回都要修复后复审。
+   * autoReview 阶段双边独立审查的引擎名列表，默认 ['claude', 'claude-fidelity']——两个独立的
+   * claude 审查者（各自全新会话、分工侧重不同），都通过（pass=true 且无 must_fix）才算这一轮过；
+   * 任一方打回都要修复后复审。配成 ['claude', 'codex'] 可换回跨厂商组合。
    * 第 1 轮全量审查（分支累计 diff）；第 2 轮起为复审：打回方复核旧意见 + 修复增量，
    * 放行方只扫修复增量，must_fix 只能来自「旧意见未修好」或「增量新问题」，旧范围新发现降级 advisory。
    * 没有人工兜底了，双边审查是唯一的质量把关。
@@ -300,11 +301,16 @@ export const DEFAULT_CONFIG: RunConfig = {
   maxReviewRounds: 2,
   maxCiRounds: 5,
   maxFixRounds: 5,
-  reviewEngines: ['claude', 'codex'],
-  reviewRoles: { claude: 'architecture', codex: 'fidelity' },
+  // 双边审查默认两个独立的 claude 审查者（各自全新会话 + 分工侧重保证独立性）；
+  // codex 引擎定义仍保留在 engines 里，仓库 ship.config.json 可随时换回跨厂商组合
+  reviewEngines: ['claude', 'claude-fidelity'],
+  reviewRoles: { claude: 'architecture', 'claude-fidelity': 'fidelity' },
   engines: {
     // 默认走各家官方 SDK（进程内、流式、会话续传）；-cli 变体是外部命令后备
     claude: { type: 'claude-sdk' },
+    // claude 的别名引擎：给第二个审查者一个独立名字（审查产物 .ship/review-<name>.json、
+    // 会话、事件 label 都按 engine 名分桶，两个审查者必须不同名）
+    'claude-fidelity': { type: 'claude-sdk' },
     codex: { type: 'codex-sdk' },
     'claude-cli': [
       'claude',

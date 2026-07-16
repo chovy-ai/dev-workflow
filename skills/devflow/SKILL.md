@@ -1,6 +1,6 @@
 ---
 name: devflow
-description: 方案在对话中聊完并确认后，把方案交给 ship harness 全自动交付（worktree 隔离实现 → claude+codex 双边审查 → 提 PR → CI/冲突修复 → 自动合并 → 清理 worktree，全程无需人工介入）。支持单仓库和多仓库联动（run group）。当用户说「交付」「ship」「走流程」「按流程执行」「开始执行方案」「交给流水线」时使用。前提是方案已经讨论并确认；方案还没确认时不要触发。
+description: 方案在对话中聊完并确认后，把方案交给 ship harness 全自动交付（worktree 隔离实现 → 双 claude 分工审查 → 提 PR → CI/冲突修复 → 自动合并 → 清理 worktree，全程无需人工介入）。支持单仓库和多仓库联动（run group）。当用户说「交付」「ship」「走流程」「按流程执行」「开始执行方案」「交给流水线」时使用。前提是方案已经讨论并确认；方案还没确认时不要触发。
 ---
 
 # devflow：把确认的方案交给全自动交付流水线（底层是 ship harness）
@@ -44,7 +44,7 @@ description: 方案在对话中聊完并确认后，把方案交给 ship harness
    npx tsx ~/Desktop/dev-workflow/cli/index.ts start --plan plan.md --engine <claude|codex> --no-attach
    ```
    记下输出里的 run id，后面两步都要用。
-   **`--engine` 跟随发起方**：方案是在哪个 agent 的对话里聊定的，实现就用哪个 engine——你是 Claude Code 就传 `--engine claude`，你是 Codex 就传 `--engine codex`。用户明确点名用另一个 engine 时听用户的。双边审查恒为 claude+codex，不受此参数影响。
+   **`--engine` 跟随发起方**：方案是在哪个 agent 的对话里聊定的，实现就用哪个 engine——你是 Claude Code 就传 `--engine claude`，你是 Codex 就传 `--engine codex`。用户明确点名用另一个 engine 时听用户的。双边审查默认为两个独立的 claude 审查者（架构/方案符合性分工），不受此参数影响。
 
 4. **用后台监听拿完成通知，而不是自己傻等或撒手不管**：`ship attach <run-id>` 本身就是一条会阻塞到该 run
    到达终态（`done`/`failed`）才退出的命令，退出时的输出就是最终结果（PR 链接，或失败原因）。**不要同步
@@ -57,7 +57,7 @@ description: 方案在对话中聊完并确认后，把方案交给 ship harness
    据此告诉用户结果、或者接着做下一步（比如触发依赖它的下一个任务）。
    如果你所在的环境没有这种后台+完成通知的能力，退回旧办法：跳过这步，直接执行下一步。
 
-5. **交还给用户**：把 run id 和 web 链接（http://localhost:4870/#/run/<id>）告诉用户，说明：流水线全自动跑完——建 worktree（基于最新 origin/base，不碰用户当前的工作目录）→ 实现 → claude+codex 双边分工审查（claude 审全局架构、codex 逐条核对方案符合性；第 1 轮全量、第 2 轮复审收窄到旧意见+修复增量，都通过才放行，打回未过即熔断）→ 提 PR → 挂 GitHub auto-merge + CI/冲突修复循环（required 检查一绿即自动合并，不等非必需检查）→ 清理 worktree。**不会停下来等任何人操作**。跑完是 `done`（PR 已自动合并）或 `failed`（某环节熔断或环境问题，看 web 上的 statusDetail）。如果第 4 步挂了后台监听，等它通知你之后可以直接把结果告诉用户，不用用户自己去 web 上看。
+5. **交还给用户**：把 run id 和 web 链接（http://localhost:4870/#/run/<id>）告诉用户，说明：流水线全自动跑完——建 worktree（基于最新 origin/base，不碰用户当前的工作目录）→ 实现 → 双 claude 分工审查（两个独立会话：一个审全局架构、一个逐条核对方案符合性；第 1 轮全量、第 2 轮复审收窄到旧意见+修复增量，都通过才放行，打回未过即熔断）→ 提 PR → 挂 GitHub auto-merge + CI/冲突修复循环（required 检查一绿即自动合并，不等非必需检查）→ 清理 worktree。**不会停下来等任何人操作**。跑完是 `done`（PR 已自动合并）或 `failed`（某环节熔断或环境问题，看 web 上的 statusDetail）。如果第 4 步挂了后台监听，等它通知你之后可以直接把结果告诉用户，不用用户自己去 web 上看。
 
 6. **失败后的处置**：
    - 环境类问题（网络抖动、push 失败、server 重启）使用**断点续跑**：

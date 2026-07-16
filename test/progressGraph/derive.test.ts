@@ -23,7 +23,12 @@ function mkRun(over: Partial<RunRecord>): RunRecord {
     sdkSessions: {},
     createdAt: '2026-01-01T00:00:00.000Z',
     updatedAt: '2026-01-01T00:00:00.000Z',
-    config: DEFAULT_CONFIG,
+    // 测试场景固定用 claude+codex 组合（deriveGraph 对引擎名无假设，不跟随默认配置漂移）
+    config: {
+      ...DEFAULT_CONFIG,
+      reviewEngines: ['claude', 'codex'],
+      reviewRoles: { claude: 'architecture', codex: 'fidelity' },
+    },
     ...over,
   };
 }
