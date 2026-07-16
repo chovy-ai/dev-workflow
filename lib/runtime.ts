@@ -206,6 +206,15 @@ export function resumeRun(id: string): { run?: RunRecord; error?: string; status
   // 归档不影响断点续跑：续跑一个已归档 run 先自动取消归档，回到活跃列表
   delete run.archivedAt;
   store.save(run);
+  // 组成员的归档是两层的（组自身 archivedAt 是 GET /api/groups 的过滤口径）：若该成员属于一个
+  // 已归档的组，只清成员 archivedAt 会让 running 成员因组仍归档而从活跃侧边栏消失——必须级联清组。
+  if (run.groupId) {
+    const group = store.getGroup(run.groupId);
+    if (group?.archivedAt) {
+      delete group.archivedAt;
+      store.saveGroup(group);
+    }
+  }
   store.event(run, 'log', { msg: `⟲ 手动续跑（从阶段 ${run.stage} 继续）` });
   advance(run);
   return { run, status: 200 };
