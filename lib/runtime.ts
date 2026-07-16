@@ -4,6 +4,8 @@ import crypto from 'node:crypto';
 import { DEFAULT_CONFIG, deriveGroupStatus, type GroupRecord, type RunConfig, type RunRecord } from './types';
 import { Store } from './store';
 import { Pipeline } from './pipeline';
+import { namespaceFindingIds } from './reviewPolicy';
+import { recoveryForRun } from './recoveryPolicy';
 import { exec, git } from './exec';
 import { defaultCheckCmd, resolveDeps, validateGroupDeps } from './deps';
 
@@ -117,6 +119,11 @@ function buildConfig(repo: string, override?: Partial<RunConfig>): RunConfig {
     ...(repoCfg.engines ?? {}),
     ...(override?.engines ?? {}),
   };
+  config.testPlan = {
+    ...DEFAULT_CONFIG.testPlan,
+    ...(repoCfg.testPlan ?? {}),
+    ...(override?.testPlan ?? {}),
+  };
   return config;
 }
 
@@ -147,6 +154,7 @@ function duplicateRunError(repo: string, plan: string): string | null {
 function unknownEngineError(config: RunConfig): string | null {
   const referenced = [
     config.engine,
+    ...(config.rescueEngine ? [config.rescueEngine] : []),
     ...Object.values(config.stageEngines ?? {}),
     ...config.reviewEngines,
   ];
@@ -166,6 +174,9 @@ function startRun(
     title?: string;
     groupId?: string;
     config: RunConfig;
+    parentRunId?: string;
+    sourceBranch?: string;
+    inheritedFindings?: RunRecord['findings'];
   },
   opts?: { deferAdvance?: boolean },
 ): RunRecord {
@@ -179,6 +190,9 @@ function startRun(
     branch: null,
     worktreePath: null,
     groupId: input.groupId,
+    parentRunId: input.parentRunId,
+    sourceBranch: input.sourceBranch,
+    inheritedFindings: input.inheritedFindings,
     plan: input.plan,
     stage: 'worktree',
     status: 'running',
@@ -208,11 +222,19 @@ export function resumeRun(id: string): { run?: RunRecord; error?: string; status
   if (!run) return { error: `run 不存在：${id}`, status: 404 };
   if (run.status === 'done') return { error: '已完成的 run 不能续跑', status: 400 };
   if (isAdvancing(id)) return { error: '该 run 正在推进中，无需续跑', status: 409 };
+  const recovery = recoveryForRun(run);
+  if (run.status === 'failed' && recovery === 'supersede') {
+    return {
+      error: '该 run 已耗尽审查预算；请使用 ship supersede 创建后继执行',
+      status: 400,
+    };
+  }
   run.resumes = (run.resumes ?? 0) + 1;
   run.status = 'running';
   run.statusDetail = '';
   // 归档不影响断点续跑：续跑一个已归档 run 先自动取消归档，回到活跃列表
   delete run.archivedAt;
+  delete run.failureRecovery;
   store.save(run);
   // 组成员的归档是两层的（组自身 archivedAt 是 GET /api/groups 的过滤口径）：若该成员属于一个
   // 已归档的组，只清成员 archivedAt 会让 running 成员因组仍归档而从活跃侧边栏消失——必须级联清组。
@@ -244,6 +266,80 @@ export async function createRun(input: {
   const planErr = planTooSimpleError(input.plan);
   if (planErr) return { error: planErr, status: 400 };
   const run = startRun({ repo, plan: input.plan, title: input.title, config });
+  return { run, status: 201 };
+}
+
+/**
+ * 从失败 run 的保留分支创建后继执行。它拥有新的 run/review 预算，但继承已完成的实现和终局 findings；
+ * 与 resume 的区别是：resume 只用于环境中断，不能重置已经耗尽的审查预算。
+ */
+export async function createSuccessorRun(input: {
+  parentRunId: string;
+  plan?: string;
+  config?: Partial<RunConfig>;
+}): Promise<{ run?: RunRecord; error?: string; status: number }> {
+  const store = getStore();
+  const parent = store.get(input.parentRunId);
+  if (!parent) return { error: `父 run 不存在：${input.parentRunId}`, status: 404 };
+  if (parent.status !== 'failed') {
+    return { error: '只有 failed run 可以创建后继执行', status: 400 };
+  }
+  const recovery = recoveryForRun(parent);
+  if (recovery !== 'supersede') {
+    return { error: '该失败属于环境/执行中断，请使用 ship resume', status: 400 };
+  }
+  if (!parent.branch) return { error: '父 run 没有保留 feature branch，无法创建后继执行', status: 400 };
+  if (parent.findings.length === 0) {
+    return { error: '父 run 没有终局 findings；环境类失败请使用 ship resume', status: 400 };
+  }
+  const branchExists = await git(
+    parent.repoPath,
+    'show-ref',
+    '--verify',
+    '--quiet',
+    `refs/heads/${parent.branch}`,
+  );
+  if (branchExists.code !== 0) {
+    return { error: `父 run 的本地分支不存在：${parent.branch}`, status: 400 };
+  }
+
+  const plan = input.plan?.trim() ? input.plan : parent.plan;
+  const planErr = planTooSimpleError(plan);
+  if (planErr) return { error: planErr, status: 400 };
+  const dupErr = duplicateRunError(parent.repoPath, plan);
+  if (dupErr) return { error: dupErr, status: 409 };
+
+  const config = buildConfig(parent.repoPath, {
+    ...parent.config,
+    ...input.config,
+    engines: {
+      ...parent.config.engines,
+      ...(input.config?.engines ?? {}),
+    },
+    testPlan: {
+      ...parent.config.testPlan,
+      ...(input.config?.testPlan ?? {}),
+    },
+  });
+  const engineErr = unknownEngineError(config);
+  if (engineErr) return { error: engineErr, status: 400 };
+
+  const run = startRun({
+    repo: parent.repoPath,
+    plan,
+    title: `${parent.title}（后继）`,
+    config,
+    parentRunId: parent.id,
+    sourceBranch: parent.branch,
+    inheritedFindings: namespaceFindingIds(
+      parent.findings,
+      `parent-${parent.id}`,
+      `parent-${parent.id}`,
+    ),
+  });
+  store.event(run, 'log', {
+    msg: `继承失败 run ${parent.id}：从分支 ${parent.branch} 继续，锁定修复 ${parent.findings.length} 条终局 finding`,
+  });
   return { run, status: 201 };
 }
 

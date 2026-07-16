@@ -59,11 +59,18 @@ description: 方案在对话中聊完并确认后，把方案交给 ship harness
 
 5. **交还给用户**：把 run id 和 web 链接（http://localhost:4870/#/run/<id>）告诉用户，说明：流水线全自动跑完——建 worktree（基于最新 origin/base，不碰用户当前的工作目录）→ 实现 → claude+codex 双边分工审查（claude 审全局架构、codex 逐条核对方案符合性；第 1 轮全量、第 2 轮复审收窄到旧意见+修复增量，都通过才放行，打回未过即熔断）→ 提 PR → 挂 GitHub auto-merge + CI/冲突修复循环（required 检查一绿即自动合并，不等非必需检查）→ 清理 worktree。**不会停下来等任何人操作**。跑完是 `done`（PR 已自动合并）或 `failed`（某环节熔断或环境问题，看 web 上的 statusDetail）。如果第 4 步挂了后台监听，等它通知你之后可以直接把结果告诉用户，不用用户自己去 web 上看。
 
-6. **失败后的处置**：`failed` 的 run 支持**从断点续跑**——环境类问题（网络抖动、push 失败、server 重启）处理好后直接：
+6. **失败后的处置**：
+   - 环境类问题（网络抖动、push 失败、server 重启）使用**断点续跑**：
    ```bash
    npx tsx ~/Desktop/dev-workflow/cli/index.ts resume <run-id>
    ```
-   它会从持久化的阶段继续（worktree 被清理过会从保留的分支自动重建）。轮数熔断类失败（审查/CI 修复到上限）说明改动本身有问题，续跑大概率还是熔断——先把根因（web 上的审查意见/CI 日志）反馈给用户、修订方案后重新 `ship start`。
+   它会从持久化阶段继续（worktree 被清理过会从保留分支自动重建）。
+   - 审查轮数熔断使用**后继执行**，保留已有实现、终局 findings 和分支成果，同时获得新的审查预算：
+   ```bash
+   npx tsx ~/Desktop/dev-workflow/cli/index.ts supersede <run-id> --plan plan.md --engine <claude|codex> --no-attach
+   ```
+   原方案不需要修订时可省略 `--plan`。后继 run 会从失败 feature branch 建新分支、rebase 最新
+   origin/base、只修终局 findings，再重新走测试与双边审查；不要对审查熔断 run 使用 `resume`。
 
 ## 多仓库步骤（run group）
 
@@ -118,6 +125,7 @@ description: 方案在对话中聊完并确认后，把方案交给 ship harness
 ## 注意
 
 - **同一仓库支持并行发起多条 run**——每条 run 各自建独立 worktree，互不干扰，不用等前一条跑完再触发新的。但**同方案的重复 run 会被创建接口直接拒绝**（409），别对同一份 plan 连发两次。
-- **没有 approve/reject/cancel 这类人工门禁命令**：流水线要么全自动跑到底，要么终止为 `failed`。失败后的恢复手段只有一个：`ship resume <id>` 从断点续跑（见单仓步骤 6 的适用判断）。
+- **没有 approve/reject/cancel 这类人工门禁命令**：流水线要么全自动跑到底，要么终止为 `failed`。
+  环境中断使用 `resume`；审查熔断使用 `supersede` 创建后继 run。
 - **复盘自动累积，不用你操心**：每条 run 终态后 harness 会自动把犯过的错提炼进仓库的 `ship.lessons.md`（随后续 PR 进 git），并注入后续 run 的实现/审查上下文。你不需要做任何事，但方案里别去改这个文件。
 - `ship ls` 看所有运行、`ship groups` 看所有组、`ship attach <id>` 阻塞到该运行到达终态才返回（在它还在 `running` 时接上能看到实时输出）——这就是"监听完成"的原语，配合你所在环境的后台执行能力用，见上面第 4 步。

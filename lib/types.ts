@@ -14,10 +14,12 @@ export type StageName = (typeof STAGES)[number];
 /**
  * running  流水线推进中（含内部 review/测试/CI 修复循环，全自动，无暂停点）
  * failed   遇到无法自动恢复的问题（环境问题，或修复循环达到轮数上限），运行终止；
- *          没有 continue：需要人处理好环境后重新 `ship start`
+ *          failureRecovery 明确标记应 resume 还是 supersede
  * done     全自动跑完：LLM review 通过、测试/CI 绿、PR 已自动合并
  */
 export type RunStatus = 'running' | 'failed' | 'done';
+/** failed run 的唯一合法恢复动作；旧记录没有该字段时由 runtime 做兼容推断。 */
+export type FailureRecovery = 'resume' | 'supersede';
 
 /**
  * 引擎规格：
@@ -52,6 +54,11 @@ export interface RunConfig {
   base: string;
   /** null = 自动探测 */
   testCmd: string | null;
+  /**
+   * 分层测试门禁。仓库配置里的命令是不可被实现 engine 覆盖的最低门槛；
+   * engine 可通过 .ship/testplan.json 追加本次改动的定向命令。
+   */
+  testPlan?: Partial<ShipTestPlan>;
   maxReviewRounds: number;
   maxCiRounds: number;
   maxFixRounds: number;
@@ -59,7 +66,7 @@ export interface RunConfig {
   engines: Record<string, EngineSpec>;
   /**
    * 按步骤类型覆盖引擎，不配则用默认 engine。
-   * key: implement | fix | testFix | ciFix | conflict（review 不走这里，见 reviewEngines）
+   * key: preflight | implement | fix | testFix | ciFix | conflict（review 不走这里，见 reviewEngines）
    */
   stageEngines?: Partial<Record<StepKind, string>>;
   /**
@@ -77,10 +84,22 @@ export interface RunConfig {
    * 未配置角色的 engine 用通用审查 prompt。默认 claude→architecture、codex→fidelity。
    */
   reviewRoles?: Record<string, string>;
+  /** 终局限域救援使用的 engine；缺省自动选择与主实现 engine 不同的可用 review engine。 */
+  rescueEngine?: string;
+}
+
+export interface ShipTestPlan {
+  /** 全套门禁中优先运行，宜为秒级定向测试。 */
+  fast: string[];
+  /** 包含类型检查/相关完整测试；CI 修复至少运行这一层。 */
+  required: string[];
+  /** 进入 reviewer 前与最终只读复验时运行；只放方案明确要求且环境稳定的 E2E。 */
+  e2e: string[];
 }
 
 /** engine 调用的步骤类型（用于 stageEngines / reviewEngines 路由） */
 export type StepKind =
+  | 'preflight'
   | 'implement'
   | 'review'
   | 'fix'
@@ -133,9 +152,19 @@ export interface PendingLesson extends Lesson {
 }
 
 export interface ReviewFinding {
+  /** 跨修复/复审轮稳定追踪的 finding id；旧 reviewer 未提供时由 pipeline 补齐。 */
+  id?: string;
   file: string;
   issue: string;
   must_fix: boolean;
+  /** 被破坏的可复用不变量，而不是仅描述表面症状。 */
+  invariant?: string;
+  /** 审查者在代码中看到的直接证据。 */
+  evidence?: string;
+  /** 最小复现或会失败的用户/调用顺序。 */
+  reproduction?: string;
+  /** 回归测试必须穿过的真实生产边界，防止 mock 掉问题点。 */
+  required_test_boundary?: string;
   /** 哪个 engine 提出的这条发现（双边审查下用于区分来源） */
   reviewer?: string;
   /**
@@ -162,11 +191,18 @@ export interface RunRecord {
   worktreePath: string | null;
   /** 所属运行组（run group）id；无组的单仓运行不带此字段 */
   groupId?: string;
+  /** 失败 run 的后继执行：保留审计谱系，不复用同一个已耗尽预算的 run。 */
+  parentRunId?: string;
+  /** 后继 run 建 worktree 时作为起点的失败 feature branch。 */
+  sourceBranch?: string;
+  /** 后继 run 在 implement 阶段优先修复的终局 findings。 */
+  inheritedFindings?: ReviewFinding[];
   plan: string;
   stage: StageName;
   status: RunStatus;
   /** status 的补充说明（失败原因等） */
   statusDetail: string;
+  failureRecovery?: FailureRecovery;
   reviewRound: number;
   /** 最近一轮 LLM 审查的 must_fix 发现（给 web 展示） */
   findings: ReviewFinding[];
@@ -197,6 +233,8 @@ export interface RunRecord {
    * review 永远开新会话——独立审查靠的就是没有实现过程的上下文。
    */
   sdkSessions: Record<string, string>;
+  /** lessons 等 harness 提交完成后的基点，用于识别后续是否有人改动 harness-managed 文件。 */
+  harnessManagedBaseSha?: string;
   createdAt: string;
   updatedAt: string;
   config: RunConfig;
@@ -256,6 +294,7 @@ export const DEFAULT_CONFIG: RunConfig = {
   engine: 'claude',
   base: 'main',
   testCmd: null,
+  testPlan: { fast: [], required: [], e2e: [] },
   // 第 1 轮全量 + 第 2 轮复审（打回方复核 + 放行方扫增量）。终局轮若只剩「旧意见未修净」
   // 还有一次锁定范围的窄门补救（见 pipeline.rescueRound），所以 2 轮足够，不再多轮开荒。
   maxReviewRounds: 2,

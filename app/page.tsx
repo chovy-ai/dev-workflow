@@ -13,6 +13,7 @@ import {
 import { deriveGraph, type GraphNode } from '@/lib/progressGraph';
 import ProgressFlow from './ProgressFlow';
 import GroupFlow from './GroupFlow';
+import { recoveryForRun } from '@/lib/recoveryPolicy';
 
 const STAGES = ['worktree', 'implement', 'awaitDeps', 'autoReview', 'pr', 'ci', 'done'] as const;
 const STAGE_LABEL: Record<string, string> = {
@@ -368,6 +369,9 @@ export default function Page() {
     if (el) el.scrollTop = el.scrollHeight;
   }, [lines, tab]);
 
+  // failed run 的合法恢复动作（resume=环境中断可续跑 / supersede=审查熔断建议后继执行）
+  const failedRecovery = run?.status === 'failed' ? recoveryForRun(run) : null;
+
   // 进度图：纯函数推导（事件流 + run 快照），随 SSE 事件自动更新
   const graph = useMemo(() => (run ? deriveGraph(run, events) : null), [run, events]);
   const drawerNode: GraphNode | null = graph?.nodes.find((n) => n.id === selNode) ?? null;
@@ -654,12 +658,28 @@ export default function Page() {
                 <div className="detail-text">{run.statusDetail || STATUS_LABEL[run.status]}</div>
                 {run.status === 'failed' && (
                   <div className="actions">
-                    <button
-                      className="btn"
-                      onClick={() => doResume(run.id)}
-                    >
-                      ⟲ 从断点续跑
-                    </button>
+                    {failedRecovery === 'supersede' ? (
+                      <button
+                        className="btn"
+                        onClick={async () => {
+                          const res = await fetch(`/api/runs/${run.id}/supersede`, { method: 'POST' });
+                          const data = await res.json();
+                          if (!res.ok) {
+                            window.alert(data.error ?? '创建后继执行失败');
+                            return;
+                          }
+                          await loadRuns();
+                          location.hash = `#/run/${data.id}`;
+                        }}
+                      >
+                        ↪ 保留成果创建后继执行
+                      </button>
+                    ) : (
+                      /* 断点续跑会自动取消归档（含级联清组），doResume 一并刷新活跃与已归档缓存 */
+                      <button className="btn" onClick={() => doResume(run.id)}>
+                        ⟲ 从断点续跑
+                      </button>
+                    )}
                   </div>
                 )}
               </div>

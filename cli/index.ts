@@ -12,6 +12,7 @@ import {
   type RunEvent,
   type RunRecord,
 } from '../lib/types';
+import { recoveryForRun } from '../lib/recoveryPolicy';
 
 const SERVER = process.env.SHIP_SERVER ?? `http://localhost:${DEFAULT_PORT}`;
 const PKG_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
@@ -125,8 +126,14 @@ async function attach(runId: string): Promise<RunRecord> {
 function reportResult(run: RunRecord) {
   console.log('');
   printRun(run);
-  if (run.status === 'failed')
-    console.log(`\n→ 运行已终止。可从断点续跑：ship resume ${run.id}   （详情：${webUrl(run.id)}）`);
+  if (run.status === 'failed') {
+    const recovery = recoveryForRun(run);
+    console.log(
+      recovery === 'supersede'
+        ? `\n→ 审查熔断。保留成果创建后继执行：ship supersede ${run.id}   （详情：${webUrl(run.id)}）`
+        : `\n→ 环境/执行中断。可从断点续跑：ship resume ${run.id}   （详情：${webUrl(run.id)}）`,
+    );
+  }
   else if (run.status === 'done') console.log('\n→ 已全自动完成，PR 已合并');
 }
 
@@ -304,6 +311,33 @@ prog
   .action(async (id, o) => {
     const run = (await api('POST', `/api/runs/${id}/resume`)) as RunRecord;
     console.log(`⟲ 已续跑 ${run.id}（从阶段 ${run.stage} 继续）\nweb: ${webUrl(run.id)}\n`);
+    if (o.attach) reportResult(await attach(run.id));
+  });
+
+prog
+  .command('supersede <id>')
+  .description('从 failed run 的保留分支创建后继执行（继承实现与 findings，重置审查预算）')
+  .option('--plan <file>', '修订后的方案文件；缺省沿用父 run 方案')
+  .option('--engine <name>', '后继实现/修复 engine')
+  .option('--no-attach', '只创建不跟踪')
+  .action(async (id, o) => {
+    let plan: string | undefined;
+    if (o.plan) {
+      const planFile = path.resolve(o.plan);
+      if (!fs.existsSync(planFile)) {
+        console.error(`✖ 方案文件不存在：${planFile}`);
+        process.exit(1);
+      }
+      plan = fs.readFileSync(planFile, 'utf8');
+    }
+    const run = (await api('POST', `/api/runs/${id}/supersede`, {
+      ...(plan ? { plan } : {}),
+      ...(o.engine ? { config: { engine: o.engine } } : {}),
+    })) as RunRecord;
+    console.log(
+      `↪ 已创建后继运行 ${run.id}（父 run ${id}，来源分支 ${run.sourceBranch}）\n` +
+        `web: ${webUrl(run.id)}\n`,
+    );
     if (o.attach) reportResult(await attach(run.id));
   });
 
