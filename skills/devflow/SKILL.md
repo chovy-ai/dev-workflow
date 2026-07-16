@@ -83,6 +83,24 @@ description: 方案在对话中聊完并确认后，把方案交给 ship harness
    `path` 支持 `~` 展开和相对清单文件的相对路径；`plan` 是该仓库内的方案文件路径。
    `engine` 跟随发起方（Claude Code → `"claude"`，Codex → `"codex"`），也可在单个 repo 项里覆盖。
 
+   **仓库间有依赖时**（例如 lib 发包、a/b 等它发布后更新依赖），用 `name`/`dependsOn`/`publishes` 声明：
+   ```json
+   {
+     "title": "升级 @acme/lib 并适配",
+     "repos": [
+       { "name": "lib",  "path": "~/code/lib", "plan": "plan.md",
+         "publishes": { "package": "@acme/lib" } },
+       { "name": "app-a", "path": "~/code/a", "plan": "plan.md", "dependsOn": ["lib"] }
+     ]
+   }
+   ```
+   语义：各仓库 implement 照常并行；下游在 implement 后进入 `awaitDeps` 阶段——等上游 run 全部
+   `done`（PR 已合并），且探测到 `publishes.package` 发布了相对组创建时的新版本（默认轮询
+   `npm view <pkg> version`，可用 `publishes.check` 自定义命令、`timeoutMinutes` 调超时，默认 30 分钟），
+   然后自动执行 depBump（依赖更新到探测版本 + 修适配 + 过测试门禁）再进入双边审查。
+   上游没有 `publishes` 时下游只等其 done。等待超时 → failed，人工确认发布后 `ship resume` 从等待处续跑。
+   依赖成环 / 指向不存在的 name → 整组创建被拒（400）。
+
 3. **确保 server 在跑**（同单仓步骤 2，逻辑完全一样）。
 
 4. **触发整组**：

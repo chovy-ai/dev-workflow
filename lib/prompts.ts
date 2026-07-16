@@ -182,3 +182,17 @@ export const conflictPrompt = (p: { base: string; plan: string }) => `\
 === 方案原文 ===
 ${p.plan}
 `;
+
+export const depBumpPrompt = (p: { updates: { package: string; version: string }[]; plan: string }) => `\
+上游依赖已发布。把本仓库对下列包的依赖精确更新到给定版本，安装依赖，并修复由此产生的编译/适配问题：
+${p.updates.map((u) => `- ${u.package} → ${u.version}`).join('\n')}
+
+要求：
+- 依赖版本必须精确到上面给定的版本（不要用 ^ ~ 或 latest），并同步更新 lockfile（用仓库既有的包管理器）。
+- 只做依赖更新与必要的适配修改，不夹带无关改动。
+- 适配完成后运行与改动直接相关的定向测试自证，然后按逻辑单元 git commit。
+- 不要切换分支、不要 push、不要 merge。
+
+=== 方案原文（理解本次改动为何依赖新版本）===
+${p.plan}
+`;

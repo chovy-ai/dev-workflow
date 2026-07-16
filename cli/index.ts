@@ -184,7 +184,16 @@ async function startGroup(manifestArg: string, engineFlag?: string) {
   let manifest: {
     title?: string;
     engine?: string;
-    repos?: { path?: string; plan?: string; engine?: string }[];
+    repos?: {
+      path?: string;
+      plan?: string;
+      engine?: string;
+      /** 依赖声明（可选）：name 唯一标识；dependsOn 指向其它成员的 name */
+      name?: string;
+      dependsOn?: string[];
+      /** 该成员合并后会发布的包（下游据此等待发布并 depBump） */
+      publishes?: { package: string; check?: string; timeoutMinutes?: number };
+    }[];
   };
   try {
     manifest = JSON.parse(fs.readFileSync(manifestFile, 'utf8'));
@@ -213,6 +222,10 @@ async function startGroup(manifestArg: string, engineFlag?: string) {
       repoPath,
       plan: fs.readFileSync(planFile, 'utf8'),
       ...(engine ? { config: { engine } } : {}),
+      // 依赖声明原样透传，server 侧统一校验（未知 name/自依赖/成环 → 整组 400）
+      ...(r.name ? { name: r.name } : {}),
+      ...(r.dependsOn?.length ? { dependsOn: r.dependsOn } : {}),
+      ...(r.publishes ? { publishes: r.publishes } : {}),
     };
   });
 

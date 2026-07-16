@@ -3,6 +3,7 @@
 export const STAGES = [
   'worktree',
   'implement',
+  'awaitDeps',
   'autoReview',
   'pr',
   'ci',
@@ -79,7 +80,37 @@ export interface RunConfig {
 }
 
 /** engine 调用的步骤类型（用于 stageEngines / reviewEngines 路由） */
-export type StepKind = 'implement' | 'review' | 'fix' | 'testFix' | 'ciFix' | 'conflict' | 'retro';
+export type StepKind =
+  | 'implement'
+  | 'review'
+  | 'fix'
+  | 'testFix'
+  | 'ciFix'
+  | 'conflict'
+  | 'retro'
+  | 'depBump';
+
+/**
+ * 下游 run 对某个上游发布物的等待项（随组创建写入下游 RunRecord）。
+ * 上游声明了 publishes 才有对应等待项；上游没有发布物时下游只等其 done、跳过 depBump。
+ */
+export interface AwaitingDep {
+  /** 上游 run id */
+  runId: string;
+  /** 要等待发布的包名 */
+  package: string;
+  /**
+   * 组创建时探测到的基线版本（探测失败为 null——任何可见版本即算已发布）。
+   * 发布判定：探测版本非空且 ≠ 基线。
+   */
+  baselineVersion: string | null;
+  /** 自定义探测命令（退出码 0 且 stdout 末行输出版本号）；缺省 `npm view <package> version` */
+  check?: string;
+  /** 等待超时（分钟），缺省 30 */
+  timeoutMinutes?: number;
+  /** 探测到的新版本（awaitDeps 阶段回填，depBump 更新到该精确版本） */
+  resolvedVersion?: string;
+}
 
 /**
  * 复盘经验：run 终态后由 retro 步骤提炼，先暂存在 SHIP_HOME/knowledge/，
@@ -148,6 +179,13 @@ export interface RunRecord {
   /** 续跑次数（server 重启自动续跑 + 手动 resume 都计入；自动续跑有上限防死循环） */
   resumes?: number;
   prUrl: string | null;
+  /**
+   * 上游 run id 列表（组清单 dependsOn 解析而来）。有值时 implement 后进入 awaitDeps 阶段：
+   * 等全部上游 done（及发布探测）后才继续；无此字段的 run 行为与事件序列完全不变。
+   */
+  dependsOn?: string[];
+  /** 对声明了 publishes 的上游的发布等待项（见 AwaitingDep）；全部探测到新版本后执行 depBump */
+  awaiting?: AwaitingDep[];
   /**
    * 归档时间（ISO）。存在即视为已归档——纯展示/管理层概念，不影响执行与断点续跑。
    * 旧记录没有此字段，语义为未归档；resume 一个已归档 run 会先清除此字段再续跑。

@@ -7,6 +7,7 @@ import { exec, git, gh } from './exec';
 import { runSdkEngine } from './sdkEngine';
 import { runCodexSdkEngine } from './codexSdkEngine';
 import * as P from './prompts';
+import { awaitTimeoutMinutes, defaultCheckCmd, evalAwaitTick, versionAdvanced } from './deps';
 
 /** 流水线主动停下（非异常崩溃）：没有人工兜底，一律终结为 failed，不支持 continue */
 class Halt extends Error {}
@@ -102,6 +103,11 @@ export class Pipeline {
             break;
           case 'implement':
             await this.stageImplement();
+            // 有上游依赖才进入 awaitDeps；无依赖的 run 事件序列保持与从前完全一致
+            this.setStage(this.run.dependsOn?.length ? 'awaitDeps' : 'autoReview');
+            break;
+          case 'awaitDeps':
+            await this.stageAwaitDeps();
             this.setStage('autoReview');
             break;
           case 'autoReview':
@@ -452,6 +458,78 @@ export class Pipeline {
     if (recheck && verdict.pass === false && passed)
       this.log(`⚠ ${engineName} 判 pass=false 但阻塞项均为未给出阻塞理由的旧范围新发现（已降级 advisory），按通过处理`);
     return { passed, mustFix, advisories };
+  }
+
+  /**
+   * awaitDeps：等全部上游 run done，再对声明了 publishes 的上游做发布探测
+   * （默认轮询 `npm view <pkg> version` 直到版本相对组创建时的基线变化），
+   * 全部就绪后执行 depBump（依赖更新到探测版本 + 修适配 + 过测试门禁）。
+   * 事件降噪：进入等待、上游 done、探测到版本、超时才发 log；常规轮询静默。
+   * 超时 Halt 后人工确认发布可从断点续跑（deadline 从续跑时重新起算）。
+   */
+  private async stageAwaitDeps() {
+    const deps = this.run.dependsOn ?? [];
+    if (!deps.length) return;
+    const awaiting = this.run.awaiting ?? [];
+    const timeoutMinutes = awaitTimeoutMinutes(awaiting);
+    const pollMs = Number(process.env.SHIP_AWAIT_POLL_MS) || 30_000;
+    const deadlineMs = Date.now() + timeoutMinutes * 60_000;
+    this.log(
+      `阶段 awaitDeps：等待上游 ${deps.join('、')} 完成` +
+        (awaiting.length ? `，并等待发布：${awaiting.map((a) => a.package).join('、')}` : '') +
+        `（超时 ${timeoutMinutes} 分钟）`,
+    );
+
+    const doneAnnounced = new Set<string>();
+    const publishAnnounced = new Set<string>();
+    while (true) {
+      const upstreams = deps.map((id) => ({ id, status: this.store.get(id)?.status }));
+      for (const u of upstreams)
+        if (u.status === 'done' && !doneAnnounced.has(u.id)) {
+          doneAnnounced.add(u.id);
+          this.log(`✔ 上游 ${u.id} 已完成`);
+        }
+      // 上游全 done 后才开始烧探测命令；探测到的版本回填 awaiting[].resolvedVersion
+      const allDone = upstreams.every((u) => u.status === 'done');
+      if (allDone) {
+        for (const a of awaiting) {
+          if (a.resolvedVersion) continue;
+          const cmd = a.check ?? defaultCheckCmd(a.package);
+          const r = await exec(cmd, this.repo);
+          const version = r.code === 0 ? r.out.split('\n').filter((l) => l.trim()).pop()?.trim() ?? null : null;
+          if (versionAdvanced(a.baselineVersion, version)) {
+            a.resolvedVersion = version!;
+            this.store.save(this.run);
+            if (!publishAnnounced.has(a.package)) {
+              publishAnnounced.add(a.package);
+              this.log(`✔ 探测到 ${a.package} 已发布：${a.baselineVersion ?? '(无基线)'} → ${version}`);
+            }
+          }
+        }
+      }
+      const tick = evalAwaitTick({
+        upstreams,
+        published: awaiting.map((a) => !!a.resolvedVersion),
+        nowMs: Date.now(),
+        deadlineMs,
+        timeoutMinutes,
+      });
+      if (tick.kind === 'halt') throw new Halt(tick.reason);
+      if (tick.kind === 'ready') break;
+      await new Promise((r) => setTimeout(r, pollMs));
+    }
+
+    // depBump：只在有发布物等待项时执行；更新到探测到的精确版本并过测试门禁，
+    // 保证随后进入的双边审查覆盖的是含依赖更新的最终代码
+    const updates = awaiting
+      .filter((a) => a.resolvedVersion)
+      .map((a) => ({ package: a.package, version: a.resolvedVersion! }));
+    if (updates.length) {
+      await this.engineRun(P.depBumpPrompt({ updates, plan: this.run.plan }), 'dep-bump', 'depBump');
+      await this.autoCommitIfDirty('ship: bump upstream deps after publish');
+      await this.gateTests();
+    }
+    this.log('✔ 上游依赖就绪，继续流水线');
   }
 
   private async stagePr() {

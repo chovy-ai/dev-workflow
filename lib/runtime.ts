@@ -4,7 +4,8 @@ import crypto from 'node:crypto';
 import { DEFAULT_CONFIG, deriveGroupStatus, type GroupRecord, type RunConfig, type RunRecord } from './types';
 import { Store } from './store';
 import { Pipeline } from './pipeline';
-import { git } from './exec';
+import { exec, git } from './exec';
+import { defaultCheckCmd, resolveDeps, validateGroupDeps } from './deps';
 
 /**
  * Next.js 开发模式会按需重编译模块；用 globalThis 缓存保证
@@ -153,14 +154,21 @@ function unknownEngineError(config: RunConfig): string | null {
   return bad ? `未知 engine：${bad}（可用：${Object.keys(config.engines).join(' / ')}）` : null;
 }
 
-/** 落盘一条新 run 并异步推进（repo 须已通过 validateRepoForRun 校验、config 已 buildConfig+校验） */
-function startRun(input: {
-  repo: string;
-  plan: string;
-  title?: string;
-  groupId?: string;
-  config: RunConfig;
-}): RunRecord {
+/**
+ * 落盘一条新 run 并异步推进（repo 须已通过 validateRepoForRun 校验、config 已 buildConfig+校验）。
+ * deferAdvance=true 时只落盘不推进——组创建要先把依赖字段（dependsOn/awaiting）补齐再统一推进，
+ * 否则下游 run 可能在依赖写入前就跑过了 implement。
+ */
+function startRun(
+  input: {
+    repo: string;
+    plan: string;
+    title?: string;
+    groupId?: string;
+    config: RunConfig;
+  },
+  opts?: { deferAdvance?: boolean },
+): RunRecord {
   const store = getStore();
   const now = new Date().toISOString();
   const firstLine = input.plan.split('\n').find((l) => l.trim());
@@ -186,7 +194,7 @@ function startRun(input: {
   };
   store.save(run);
   store.event(run, 'log', { msg: `运行创建：${run.title}（${input.repo}）` });
-  advance(run);
+  if (!opts?.deferAdvance) advance(run);
   return run;
 }
 
@@ -246,10 +254,21 @@ export async function createRun(input: {
  */
 export async function createGroup(input: {
   title: string;
-  repos: { repoPath: string; plan: string; config?: Partial<RunConfig> }[];
+  repos: {
+    repoPath: string;
+    plan: string;
+    config?: Partial<RunConfig>;
+    /** 依赖声明（可选）：见 lib/deps.GroupRepoDeps */
+    name?: string;
+    dependsOn?: string[];
+    publishes?: { package: string; check?: string; timeoutMinutes?: number };
+  }[];
 }): Promise<{ group?: GroupRecord; runs?: RunRecord[]; error?: string; status: number }> {
   const store = getStore();
   if (!input.repos.length) return { error: '组至少需要一个仓库', status: 400 };
+  // 依赖声明校验（未知 name / 自依赖 / 成环 → 整组 400，一个 run 都不建）
+  const depErr = validateGroupDeps(input.repos);
+  if (depErr) return { error: depErr, status: 400 };
 
   // 1. 原子校验：所有仓库先过一遍（含组内去重、engine 名校验），任一失败整组不创建
   const resolved: { repo: string; plan: string; config: RunConfig }[] = [];
@@ -276,11 +295,40 @@ export async function createGroup(input: {
     runIds: [],
     createdAt: new Date().toISOString(),
   };
+  // 先全部落盘（不推进），把 name 依赖解析成 run id 依赖并探测发布基线，再统一推进——
+  // 保证下游 run 在开始执行前 dependsOn/awaiting 已就位
   const runs = resolved.map((item) => {
-    const run = startRun({ repo: item.repo, plan: item.plan, groupId: group.id, config: item.config });
+    const run = startRun(
+      { repo: item.repo, plan: item.plan, groupId: group.id, config: item.config },
+      { deferAdvance: true },
+    );
     group.runIds.push(run.id);
     return run;
   });
+  const deps = resolveDeps(input.repos, group.runIds);
+  for (let i = 0; i < runs.length; i++) {
+    if (!deps[i].dependsOn.length) continue;
+    runs[i].dependsOn = deps[i].dependsOn;
+    runs[i].awaiting = await Promise.all(
+      deps[i].awaiting.map(async (a) => {
+        // 基线版本在创建时探测一次（在下游仓库目录执行，吃它的 .npmrc/registry 配置）；
+        // 探测失败视为无基线——之后任何可见版本即算已发布
+        const r = await exec(a.check ?? defaultCheckCmd(a.package), runs[i].repoPath);
+        const baseline =
+          r.code === 0 ? r.out.split('\n').filter((l) => l.trim()).pop()?.trim() ?? null : null;
+        return { ...a, baselineVersion: baseline };
+      }),
+    );
+    store.save(runs[i]);
+    store.event(runs[i], 'log', {
+      msg:
+        `依赖声明：等待 ${deps[i].dependsOn.join('、')}` +
+        (runs[i].awaiting!.length
+          ? `；发布物 ${runs[i].awaiting!.map((a) => `${a.package}（基线 ${a.baselineVersion ?? '无'}）`).join('、')}`
+          : ''),
+    });
+  }
+  for (const run of runs) advance(run);
   store.saveGroup(group);
   return { group, runs, status: 201 };
 }
