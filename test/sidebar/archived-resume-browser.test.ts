@@ -196,7 +196,9 @@ before(async () => {
     90_000,
   );
 
-  const chromePort = await freePort();
+  // 用 --remote-debugging-port=0 让 Chrome 自选端口，消除“预选端口在 spawn 前被 Next dev 的
+  // HMR/worker socket 抢占”导致 Chrome 调试服务起不来、CDP 端点永远 fetch failed 的竞态。
+  // Chrome 只有在调试服务真正监听后，才把「端口\nws路径」写入 user-data-dir/DevToolsActivePort。
   chrome = spawn(
     CHROME,
     [
@@ -204,11 +206,23 @@ before(async () => {
       '--disable-gpu',
       '--no-first-run',
       '--no-default-browser-check',
-      `--remote-debugging-port=${chromePort}`,
+      '--remote-debugging-port=0',
+      '--remote-allow-origins=*',
       `--user-data-dir=${profile}`,
       'about:blank',
     ],
     { stdio: 'ignore', detached: true },
+  );
+  const activePortFile = path.join(profile, 'DevToolsActivePort');
+  const chromePort = await waitFor(
+    'Chrome DevTools 端口写入',
+    async () => {
+      if (!fs.existsSync(activePortFile)) return false;
+      const firstLine = fs.readFileSync(activePortFile, 'utf8').split('\n')[0]?.trim();
+      const port = Number(firstLine);
+      return Number.isInteger(port) && port > 0 ? port : false;
+    },
+    30_000,
   );
   const target = await waitFor(
     'Chrome CDP 就绪',
