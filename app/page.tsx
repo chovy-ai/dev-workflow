@@ -5,6 +5,7 @@ import type { GroupRecord, RunEvent, RunRecord } from '@/lib/types';
 import {
   partition,
   archivedItems,
+  toItems,
   relativeTime,
   type GroupSummary,
   type SidebarItem,
@@ -226,6 +227,16 @@ export default function Page() {
     if (res.ok) setRun(await res.json());
   }, []);
 
+  // 从断点续跑：resume 会自动取消归档（含级联清组），必须同时刷新活跃与已归档缓存，
+  // 否则同一 run 会残留在「已归档」缓存里，直到用户折叠再展开才消失。
+  const doResume = useCallback(
+    async (id: string) => {
+      await fetch(`/api/runs/${id}/resume`, { method: 'POST' });
+      await Promise.all([refreshRun(id), loadRuns(), archivedOpen ? loadArchived() : Promise.resolve()]);
+    },
+    [refreshRun, loadRuns, loadArchived, archivedOpen],
+  );
+
   const loadDiff = useCallback(async (id: string) => {
     const res = await fetch(`/api/runs/${id}/diff`);
     if (res.ok) setDiff((await res.json()).diff ?? '');
@@ -332,9 +343,12 @@ export default function Page() {
 
   const stageIdx = run ? STAGES.indexOf(run.stage) : -1;
 
-  // 四分区：活跃三区从未归档数据推导，已归档区来自懒加载的 ?archived=1 数据
+  // 四分区：活跃三区从未归档数据推导，已归档区来自懒加载的 ?archived=1 数据。
+  // 把活跃条目 id 传给 archivedItems 做结构性互斥：即便已归档缓存短暂陈旧（如 resume
+  // 自动取消归档后活跃列表已更新、缓存未刷新），也不让同一条目同时出现在两个分区。
   const parts = partition(runs, groups);
-  const archived = archivedItems(archivedRuns, archivedGroups);
+  const activeIds = new Set(toItems(runs, groups).map((i) => i.id));
+  const archived = archivedItems(archivedRuns, archivedGroups, activeIds);
   const listEmpty = runs.length === 0 && groups.length === 0;
 
   // 渲染一个侧边栏条目（散 run 或组）。inArchived=true 时归档按钮变「还原」。
@@ -581,11 +595,7 @@ export default function Page() {
                   <div className="actions">
                     <button
                       className="btn"
-                      onClick={async () => {
-                        await fetch(`/api/runs/${run.id}/resume`, { method: 'POST' });
-                        refreshRun(run.id);
-                        loadRuns();
-                      }}
+                      onClick={() => doResume(run.id)}
                     >
                       ⟲ 从断点续跑
                     </button>

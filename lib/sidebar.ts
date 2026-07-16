@@ -62,9 +62,18 @@ export function partition(runs: RunRecord[], groups: GroupSummary[]): Partitions
   };
 }
 
-/** 已归档分区：任意状态，统一按 updatedAt 倒序 */
-export function archivedItems(runs: RunRecord[], groups: GroupSummary[]): SidebarItem[] {
-  return sortByUpdatedAtDesc(toItems(runs, groups));
+/**
+ * 已归档分区：任意状态，统一按 updatedAt 倒序。
+ * 结构性互斥：剔除已出现在活跃集（activeIds）里的条目——即便 ?archived=1 缓存短暂陈旧
+ * （如 resume 自动取消归档后活跃列表已更新、但已归档缓存尚未刷新），也不让同一条目同时
+ * 出现在活跃分区与已归档分区。默认不传时保持全部保留（向后兼容）。
+ */
+export function archivedItems(
+  runs: RunRecord[],
+  groups: GroupSummary[],
+  activeIds: Set<string> = new Set(),
+): SidebarItem[] {
+  return sortByUpdatedAtDesc(toItems(runs, groups).filter((it) => !activeIds.has(it.id)));
 }
 
 /**
