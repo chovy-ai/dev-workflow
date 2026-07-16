@@ -4,22 +4,31 @@ import { deriveGroupStatus } from '@/lib/types';
 
 export const dynamic = 'force-dynamic';
 
-/** 组列表：每项带推导状态与成员 run 摘要 */
-export async function GET() {
+/**
+ * 组列表：每项带推导状态与成员 run 摘要。
+ * 默认过滤掉已归档组（按组自身 archivedAt，与成员各自的 archivedAt 独立）；?archived=1 只返回已归档组。
+ * 成员摘要带 updatedAt，供侧边栏推导组的最大 updatedAt 用于排序。
+ */
+export async function GET(req: NextRequest) {
+  const archived = new URL(req.url).searchParams.get('archived') === '1';
   const store = getStore();
-  const groups = store.listGroups().map((g) => {
-    const runs = store.groupRuns(g);
-    return {
-      ...g,
-      status: deriveGroupStatus(runs),
-      runs: runs.map((r) => ({
-        id: r.id,
-        repoPath: r.repoPath,
-        stage: r.stage,
-        status: r.status,
-      })),
-    };
-  });
+  const groups = store
+    .listGroups()
+    .filter((g) => !!g.archivedAt === archived)
+    .map((g) => {
+      const runs = store.groupRuns(g);
+      return {
+        ...g,
+        status: deriveGroupStatus(runs),
+        runs: runs.map((r) => ({
+          id: r.id,
+          repoPath: r.repoPath,
+          stage: r.stage,
+          status: r.status,
+          updatedAt: r.updatedAt,
+        })),
+      };
+    });
   return NextResponse.json(groups);
 }
 
