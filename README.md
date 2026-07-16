@@ -85,10 +85,17 @@ ship start --plan plan.md --engine codex   # 实现/修复用 codex（默认 cla
 #             ship resume <id> 从断点续跑（分支保留，worktree 会自动重建），或重新 ship start
 
 # 其他
-ship ls                            # 所有运行
+ship ls                            # 运行列表（默认不含已归档；--archived 只看已归档）
+ship groups                        # 运行组列表（同样支持 --archived）
 ship attach <id>                   # 阻塞到该运行到达终态（done/failed）才返回，期间打印实时输出
-ship resume <id>                   # 中断/失败的运行从持久化的阶段继续（自动重建 worktree）
+ship resume <id>                   # 中断/失败的运行从持久化的阶段继续（自动重建 worktree；已归档会自动取消归档）
+ship archive <run-id|group-id>     # 归档 run 或组（自动识别 id；running 不可归档）；--restore 还原
+ship archive --done                # 一键归档全部已完成（done 散 run 与全 done 组），failed 不动
 ```
+
+> 归档是纯展示/管理层概念，不影响执行与断点续跑。web 侧边栏按「进行中 / 需要处理 / 已完成 / 已归档」
+> 四分区展示，区内按最近活动（updatedAt）倒序；「已完成」分区头一键「全部归档」，「已归档」默认折叠、
+> 展开才懒加载。
 
 `ship attach <id>` 阻塞到终态才退出这个特性，是给 agent 编排用的原语：agent 触发 `ship start
 --no-attach` 后，把 `ship attach <id>` 丢进自己所在环境的后台执行能力里（不同步等待），run 跑完时

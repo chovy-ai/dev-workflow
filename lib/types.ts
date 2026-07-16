@@ -149,6 +149,11 @@ export interface RunRecord {
   resumes?: number;
   prUrl: string | null;
   /**
+   * 归档时间（ISO）。存在即视为已归档——纯展示/管理层概念，不影响执行与断点续跑。
+   * 旧记录没有此字段，语义为未归档；resume 一个已归档 run 会先清除此字段再续跑。
+   */
+  archivedAt?: string;
+  /**
    * SDK 引擎的工作线程会话，按引擎名分桶（claude 的 session_id 和 codex 的 thread_id 不通用）。
    * 工作步骤（实现/修复/CI修复/解冲突）续用同一会话，修复时带着实现的上下文；
    * review 永远开新会话——独立审查靠的就是没有实现过程的上下文。
@@ -170,6 +175,11 @@ export interface GroupRecord {
   /** 成员 run id（创建顺序） */
   runIds: string[];
   createdAt: string;
+  /**
+   * 组归档时间（ISO）。存在即视为已归档；以组自身此字段为过滤口径（与成员各自的 archivedAt 独立）。
+   * 组归档级联把全部非-running 成员一并置 archivedAt（见 runtime.archiveGroup）。
+   */
+  archivedAt?: string;
 }
 
 /**

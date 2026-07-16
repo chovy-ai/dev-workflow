@@ -1,7 +1,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
-import { DEFAULT_CONFIG, type GroupRecord, type RunConfig, type RunRecord } from './types';
+import { DEFAULT_CONFIG, deriveGroupStatus, type GroupRecord, type RunConfig, type RunRecord } from './types';
 import { Store } from './store';
 import { Pipeline } from './pipeline';
 import { git } from './exec';
@@ -203,7 +203,18 @@ export function resumeRun(id: string): { run?: RunRecord; error?: string; status
   run.resumes = (run.resumes ?? 0) + 1;
   run.status = 'running';
   run.statusDetail = '';
+  // 归档不影响断点续跑：续跑一个已归档 run 先自动取消归档，回到活跃列表
+  delete run.archivedAt;
   store.save(run);
+  // 组成员的归档是两层的（组自身 archivedAt 是 GET /api/groups 的过滤口径）：若该成员属于一个
+  // 已归档的组，只清成员 archivedAt 会让 running 成员因组仍归档而从活跃侧边栏消失——必须级联清组。
+  if (run.groupId) {
+    const group = store.getGroup(run.groupId);
+    if (group?.archivedAt) {
+      delete group.archivedAt;
+      store.saveGroup(group);
+    }
+  }
   store.event(run, 'log', { msg: `⟲ 手动续跑（从阶段 ${run.stage} 继续）` });
   advance(run);
   return { run, status: 200 };
@@ -272,4 +283,86 @@ export async function createGroup(input: {
   });
   store.saveGroup(group);
   return { group, runs, status: 201 };
+}
+
+// ---------------------------------------------------------------- 归档（纯展示/管理层，不碰执行语义）
+
+/**
+ * 归档 / 还原单个 run。archived=true 置 archivedAt 为当前时间，false 清除（还原）。
+ * running 不可归档（400，进行中不可归档）——failed / done 才能归档。
+ */
+export function archiveRun(
+  id: string,
+  archived: boolean,
+): { run?: RunRecord; error?: string; status: number } {
+  const store = getStore();
+  const run = store.get(id);
+  if (!run) return { error: `run 不存在：${id}`, status: 404 };
+  if (archived && run.status === 'running')
+    return { error: '运行进行中，不可归档（failed / done 才能归档）', status: 400 };
+  if (archived) run.archivedAt = new Date().toISOString();
+  else delete run.archivedAt;
+  store.save(run);
+  return { run, status: 200 };
+}
+
+/**
+ * 归档 / 还原运行组，级联作用于全部成员 run。
+ * archived=true 时若有任一成员 running 则整组拒绝（400），且不做部分归档（原子：一个成员都不写）。
+ * 成员集合由真实 group.runIds 经 Store.groupRuns 解析（已丢弃不存在的 id）。
+ */
+export function archiveGroup(
+  id: string,
+  archived: boolean,
+): { group?: GroupRecord; runs?: RunRecord[]; error?: string; status: number } {
+  const store = getStore();
+  const group = store.getGroup(id);
+  if (!group) return { error: `组不存在：${id}`, status: 404 };
+  const members = store.groupRuns(group);
+  if (archived && members.some((r) => r.status === 'running'))
+    return { error: '组内有成员进行中，整组不可归档', status: 400 };
+  const now = new Date().toISOString();
+  for (const r of members) {
+    if (archived) r.archivedAt = now;
+    else delete r.archivedAt;
+    store.save(r);
+  }
+  if (archived) group.archivedAt = now;
+  else delete group.archivedAt;
+  store.saveGroup(group);
+  return { group, runs: members, status: 200 };
+}
+
+/**
+ * 一键归档：归档全部「未归档且为 done」的散 run，以及「未归档且推导状态为 done」的组（连成员）。
+ * failed 不纳入（需要人看过再手动归档）。返回实际发生变更的数量 { runs, groups }——
+ * 已归档项不重复计数（幂等：二次调用返回 0，且不刷新既有 archivedAt）。
+ */
+export function archiveDone(): { runs: number; groups: number } {
+  const store = getStore();
+  const now = new Date().toISOString();
+  let runs = 0;
+  let groups = 0;
+  // 推导状态为 done 的组：整组 + 未归档成员一起置 archivedAt
+  for (const g of store.listGroups()) {
+    if (g.archivedAt) continue;
+    const members = store.groupRuns(g);
+    if (deriveGroupStatus(members) !== 'done') continue;
+    for (const r of members) {
+      if (r.archivedAt) continue;
+      r.archivedAt = now;
+      store.save(r);
+    }
+    g.archivedAt = now;
+    store.saveGroup(g);
+    groups++;
+  }
+  // done 的散 run（组成员只经组归档，不在这里单独计入）
+  for (const r of store.list()) {
+    if (r.groupId || r.archivedAt || r.status !== 'done') continue;
+    r.archivedAt = now;
+    store.save(r);
+    runs++;
+  }
+  return { runs, groups };
 }
